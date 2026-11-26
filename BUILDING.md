@@ -212,3 +212,25 @@ validates the generated SPIR-V. These checks require no game files or captured r
 The player release is built with link-time optimization and a recorded profile (`pgo/default.profdata`): `packaging/package.sh` does this by itself when the profile is there. To build it by hand: `BB_PGO=use BB_LTO=ON bash build.sh`. The default `bash build.sh` stays the quick build.
 
 To record a new profile after the code has changed a lot: build with `BB_PGO=generate BB_LTO=ON`, run the game's benchmark and a race or two with your usual settings (the profile is written every 30 seconds into `pgo/`), then merge the `.profraw` files with `llvm-profdata merge -output=pgo/default.profdata pgo/*.profraw`.
+
+## Android ARM64 bootstrap
+
+Open `android/` in Android Studio or run `cd android && ./gradlew assembleDebug` with
+JDK 17, SDK 35, NDK 27.2.12479018 and CMake 3.22.1. Install the debug APK on an
+arm64-v8a device running Android 11 or later with `./gradlew installDebug`.
+The Android ARM64 bootstrap workflow also builds the APK and archives it as
+`driveclub-android-arm64-debug`.
+
+The app loads a native ARM64 library and enumerates Vulkan physical devices at startup.
+Optionally select the update's `sce_sys/param.sfo` with the system file picker.
+The PC preparation code identifies the US/EU title and update version from these bytes.
+The app currently implements diagnostics only. Guest CPU execution, game rendering and
+audio are pending. No game files are needed for the APK or the synthetic host test:
+
+    c++ -std=c++20 tests/test_update_metadata.cpp launcher/prepare.cpp -o /tmp/test-metadata
+    /tmp/test-metadata
+
+The ARM64 launcher layout and Gradle wrapper follow
+[ShadowOfTheColossus-Android-Aot](https://github.com/erickmendes22/ShadowOfTheColossus-Android-Aot).
+The staged CPU and presentation bring-up follows the
+[inFAMOUS Android plan](https://github.com/erickmendes22/iss_android/blob/main/docs/ANDROID_PORT.md).

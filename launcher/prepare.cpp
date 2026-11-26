@@ -358,6 +358,10 @@ std::map<std::string, std::string> ParseSfo(const Bytes& d, std::map<std::string
   return out;
 }
 
+bool IsDriveclubTitle(const std::string& title) {
+  return title == "CUSA00093" || title == "CUSA00003";
+}
+
 bool Version128(const std::map<std::string, std::string>& sfo) {
   for (const char* key : {"APP_VER", "VERSION"}) {
     const auto it = sfo.find(key);
@@ -900,6 +904,18 @@ const ModuleSource kModules[] = {
 
 }  // namespace
 
+UpdateMetadata InspectUpdateMetadata(const std::vector<uint8_t>& bytes) {
+  try {
+    const auto fields = ParseSfo(bytes, nullptr);
+    const auto title = fields.find("TITLE_ID");
+    if (title == fields.end()) return UpdateMetadata::invalid;
+    if (!IsDriveclubTitle(title->second)) return UpdateMetadata::other_title;
+    return Version128(fields) ? UpdateMetadata::driveclub_128 : UpdateMetadata::other_version;
+  } catch (const std::exception&) {
+    return UpdateMetadata::invalid;
+  }
+}
+
 bool SfoIsVersion128(const fs::path& param_sfo) {
   try {
     return Version128(ParseSfo(ReadFile(param_sfo), nullptr));
@@ -977,7 +993,7 @@ std::string PrepareGame(const fs::path& update, const fs::path& base, const fs::
     const auto sfo = ParseSfo(ReadFile(update / "sce_sys" / "param.sfo"), &ints);
     // The US release (CUSA00093) or the European one (CUSA00003).
     const std::string title = sfo.count("TITLE_ID") ? sfo.at("TITLE_ID") : std::string();
-    if (title != "CUSA00093" && title != "CUSA00003") return "The update folder is not DriveClub (CUSA00093 or CUSA00003).";
+    if (!IsDriveclubTitle(title)) return "The update folder is not DriveClub (CUSA00093 or CUSA00003).";
     if (!FolderIsVersion128(update)) {
       const auto field = [&](const char* key) { return sfo.count(key) ? sfo.at(key) : std::string("none"); };
       return "The update folder must be DriveClub version 1.28 (its param.sfo says APP_VER " + field("APP_VER") + ", VERSION " + field("VERSION") + ").";

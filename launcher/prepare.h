@@ -1,12 +1,18 @@
 // First-run preparation of the user's game dumps (see prepare.cpp).
 #pragma once
 
+#include <cstdint>
+#include <vector>
 #include <filesystem>
 #include <functional>
 #include <string>
 
 // The format of work/prep/boot-linked.bin: a game prepared in another format is prepared again.
 constexpr char kBootFormat[] = "BBPROBE6";
+
+enum class UpdateMetadata { invalid, other_title, other_version, driveclub_128 };
+// Inspect an SFO obtained from a document provider without opening a game executable.
+UpdateMetadata InspectUpdateMetadata(const std::vector<uint8_t>& bytes);
 
 // Converts the update dump (and the base dump's modules) into the runtime image under `work`:
 //   work/prep/boot-linked.bin, content.bin, patches.bin, eboot.elf, image.meta

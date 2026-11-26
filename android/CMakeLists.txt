@@ -1,0 +1,7 @@
+cmake_minimum_required(VERSION 3.22)
+project(driveclub_android LANGUAGES CXX)
+add_library(driveclub_android SHARED src/main/cpp/bridge.cpp ../launcher/prepare.cpp)
+target_compile_features(driveclub_android PRIVATE cxx_std_20)
+target_include_directories(driveclub_android PRIVATE ../launcher)
+target_link_libraries(driveclub_android PRIVATE vulkan)
+target_link_options(driveclub_android PRIVATE "-Wl,-z,max-page-size=16384")
