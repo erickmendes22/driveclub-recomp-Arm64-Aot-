@@ -1,76 +1,228 @@
 package org.driveclub.port;
 
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.content.Intent;
+import android.graphics.Color;
+import android.graphics.Typeface;
+import android.graphics.drawable.GradientDrawable;
+import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
-import android.widget.Button;
-import android.widget.LinearLayout;
-import android.widget.TextView;
-import java.io.ByteArrayOutputStream;
+import android.view.Gravity;
+import android.view.InputDevice;
+import android.view.MotionEvent;
+import android.view.View;
+import android.widget.*;
 import java.io.IOException;
-import java.io.InputStream;
-import java.util.concurrent.ExecutorService;
+import java.util.Locale;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ExecutorService;
 
 public final class PortActivity extends Activity {
     static { System.loadLibrary("driveclub_android"); }
     private static native String probeGraphics();
-    private static native String inspect(byte[] sfo);
-    private static final int PICK_SFO = 1;
+    static native String inspect(byte[] sfo);
+
+    private static final int SFO = 1, BASE = 2, UPDATE = 3;
+    private static final int BG = 0xff101116, PANEL = 0xff202128, RED = 0xffff394e,
+            WHITE = 0xfffafafa, MUTED = 0xffc0c1ca;
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
-    private TextView result;
+    private GameLibrary library;
+    private LinearLayout page, tabs, content;
+    private TextView pad;
+    private boolean system;
+    private String gpu = "Consultando o driver…";
+    private String controller = "Mova o analógico ou pressione um gatilho.";
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
-        LinearLayout layout = new LinearLayout(this);
-        layout.setOrientation(LinearLayout.VERTICAL);
-        int padding = Math.round(16 * getResources().getDisplayMetrics().density);
-        layout.setPadding(padding, padding, padding, padding);
-        TextView graphics = new TextView(this);
-        graphics.setText("Verificando Vulkan…");
-        layout.addView(graphics);
-        Button pick = new Button(this);
-        pick.setText("Verificar param.sfo");
-        pick.setOnClickListener(v -> startActivityForResult(new Intent(Intent.ACTION_OPEN_DOCUMENT)
-                .addCategory(Intent.CATEGORY_OPENABLE).setType("*/*"), PICK_SFO));
-        layout.addView(pick);
-        result = new TextView(this);
-        result.setText(state == null ? "Selecione sce_sys/param.sfo da atualização para verificar título e versão."
-                : state.getString("result"));
-        layout.addView(result);
-        setContentView(layout);
-        worker.execute(() -> {
-            String status = probeGraphics();
-            runOnUiThread(() -> graphics.setText(status));
+        library = new GameLibrary(this);
+        system = state != null && state.getBoolean("system");
+        ScrollView scroll = new ScrollView(this);
+        scroll.setBackgroundColor(BG);
+        scroll.setFillViewport(true);
+        scroll.setOnApplyWindowInsetsListener((v, insets) -> {
+            android.graphics.Insets bars = insets.getInsets(android.view.WindowInsets.Type.systemBars()
+                    | android.view.WindowInsets.Type.displayCutout());
+            v.setPadding(bars.left, bars.top, bars.right, bars.bottom);
+            return insets;
         });
+        getWindow().setDecorFitsSystemWindows(false);
+        page = column();
+        scroll.addView(page);
+        setContentView(scroll);
+        render();
+        worker.execute(() -> {
+            String value = probeGraphics();
+            runOnUiThread(() -> { gpu = value; if (system && !isDestroyed()) body(); });
+        });
+    }
+
+    private int dp(int value) { return Math.round(value * getResources().getDisplayMetrics().density); }
+
+    private LinearLayout column() {
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        return box;
+    }
+
+    private TextView text(String value, int size, int color, boolean bold) {
+        TextView view = new TextView(this);
+        view.setText(value);
+        view.setTextSize(size);
+        view.setTextColor(color);
+        view.setTypeface(Typeface.create(bold ? "sans-serif-condensed" : "sans-serif",
+                bold ? Typeface.BOLD : Typeface.NORMAL));
+        return view;
+    }
+
+    private void inset(View view, int x, int y) { view.setPadding(dp(x), dp(y), dp(x), dp(y)); }
+
+    private void render() {
+        ImageView logo = new ImageView(this);
+        logo.setImageResource(R.drawable.driveclub_wordmark);
+        logo.setContentDescription("Driveclub");
+        logo.setScaleType(ImageView.ScaleType.FIT_START);
+        inset(logo, 20, 14);
+        page.addView(logo, -1, dp(51));
+
+        FrameLayout hero = new FrameLayout(this);
+        ImageView photo = new ImageView(this);
+        photo.setImageResource(R.drawable.garage_cover);
+        photo.setScaleType(ImageView.ScaleType.CENTER_CROP);
+        hero.addView(photo, -1, -1);
+        View shade = new View(this);
+        shade.setBackground(new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM,
+                new int[]{0x00000000, 0x30000000, 0xe8101116}));
+        hero.addView(shade, -1, -1);
+        TextView title = text("Garagem", 44, WHITE, true);
+        inset(title, 20, 8);
+        hero.addView(title, new FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM));
+        page.addView(hero, -1, dp(getResources().getConfiguration().screenHeightDp < 500 ? 118 : 178));
+        tabs = new LinearLayout(this);
+        page.addView(tabs);
+        content = column();
+        inset(content, 18, 14);
+        page.addView(content);
+        body();
+    }
+
+    private void tab(String label, boolean target) {
+        LinearLayout container = column();
+        TextView button = text(label, 17, system == target ? WHITE : MUTED, true);
+        button.setGravity(Gravity.CENTER);
+        container.addView(button, -1, dp(48));
+        View line = new View(this);
+        line.setBackgroundColor(system == target ? RED : PANEL);
+        container.addView(line, -1, dp(3));
+        container.setSelected(system == target);
+        container.setFocusable(true);
+        container.setContentDescription(label);
+        container.setOnClickListener(v -> { system = target; body(); });
+        tabs.addView(container, new LinearLayout.LayoutParams(0, -2, 1));
+    }
+
+    private LinearLayout card(String title) {
+        LinearLayout box = column();
+        inset(box, 16, 12);
+        box.setBackgroundColor(PANEL);
+        LinearLayout.LayoutParams spacing = new LinearLayout.LayoutParams(-1, -2);
+        spacing.bottomMargin = dp(10);
+        content.addView(box, spacing);
+        box.addView(text(title, 21, WHITE, true));
+        return box;
+    }
+
+    private void action(LinearLayout box, String label, Runnable callback) {
+        Button button = new Button(this, null, android.R.attr.borderlessButtonStyle);
+        button.setAllCaps(false);
+        button.setText(label);
+        button.setTextColor(RED);
+        button.setGravity(Gravity.START | Gravity.CENTER_VERTICAL);
+        button.setPadding(0, 0, 0, 0);
+        button.setMinHeight(dp(48));
+        button.setOnClickListener(v -> callback.run());
+        box.addView(button);
+    }
+
+    private void body() {
+        tabs.removeAllViews();
+        tab("Biblioteca", false);
+        tab("Sistema", true);
+        content.removeAllViews();
+        pad = null;
+        if (system) {
+            LinearLayout device = card("Dispositivo");
+            device.addView(text(Build.MANUFACTURER + " " + Build.MODEL + "  ·  Android " + Build.VERSION.RELEASE, 15, MUTED, false));
+            LinearLayout graphics = card("Processador gráfico");
+            graphics.addView(text(gpu, 16, WHITE, false));
+            LinearLayout controls = card("Teste de controle");
+            pad = text(controller, 16, MUTED, false);
+            controls.addView(pad);
+            action(card("Metadados do jogo"), "Abrir param.sfo", () -> startActivityForResult(
+                    new Intent(Intent.ACTION_OPEN_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE).setType("*/*"), SFO));
+        } else {
+            folderCard("Jogo base", GameLibrary.BASE, BASE);
+            folderCard("Atualização 1.28", GameLibrary.UPDATE, UPDATE);
+            content.addView(text("Execução do jogo em desenvolvimento.", 14, MUTED, false));
+        }
+    }
+
+    private void folderCard(String title, String key, int request) {
+        LinearLayout box = card(title);
+        boolean selected = library.folder(key) != null;
+        TextView result = text(selected ? "Verificando pasta…" :
+                (key.equals(GameLibrary.BASE) ? "Selecione a pasta que contém game000.dat." :
+                "Selecione a pasta que contém sce_sys."), 15, MUTED, false);
+        box.addView(result);
+        action(box, selected ? "Trocar pasta  ›" : "Escolher pasta  ›", () -> startActivityForResult(
+                new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION
+                        | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION), request));
+        if (selected) worker.execute(() -> {
+            String message;
+            try { message = library.summary(key); }
+            catch (IOException | RuntimeException e) { message = "Pasta inacessível. Selecione novamente."; }
+            String status = message;
+            runOnUiThread(() -> result.setText(status));
+        });
+    }
+
+    @Override public boolean onGenericMotionEvent(MotionEvent event) {
+        if (pad == null || !event.isFromSource(InputDevice.SOURCE_JOYSTICK)
+                || event.getAction() != MotionEvent.ACTION_MOVE) return super.onGenericMotionEvent(event);
+        float steer = event.getAxisValue(MotionEvent.AXIS_X);
+        float gas = Math.max(event.getAxisValue(MotionEvent.AXIS_RTRIGGER), event.getAxisValue(MotionEvent.AXIS_GAS));
+        float brake = Math.max(event.getAxisValue(MotionEvent.AXIS_LTRIGGER), event.getAxisValue(MotionEvent.AXIS_BRAKE));
+        controller = String.format(Locale.getDefault(), "Direção %+.0f%%   ·   R2 %.0f%%   ·   L2 %.0f%%",
+                steer * 100, gas * 100, brake * 100);
+        pad.setText(controller);
+        return true;
     }
 
     @Override protected void onActivityResult(int request, int code, Intent data) {
         super.onActivityResult(request, code, data);
-        if (request != PICK_SFO || code != RESULT_OK || data == null || data.getData() == null) return;
-        worker.execute(() -> {
+        if (code != RESULT_OK || data == null || data.getData() == null) return;
+        Uri uri = data.getData();
+        if (request == BASE || request == UPDATE) {
+            try { library.select(request == BASE ? GameLibrary.BASE : GameLibrary.UPDATE, uri); }
+            catch (SecurityException e) { Toast.makeText(this, "Falha ao obter acesso à pasta.", Toast.LENGTH_LONG).show(); }
+            body();
+        } else if (request == SFO) worker.execute(() -> {
             String status;
-            try (InputStream input = getContentResolver().openInputStream(data.getData())) {
-                if (input == null) throw new IOException();
-                ByteArrayOutputStream bytes = new ByteArrayOutputStream();
-                byte[] block = new byte[4096];
-                int length;
-                while ((length = input.read(block)) != -1) {
-                    if (bytes.size() + length > 65536) throw new IOException();
-                    bytes.write(block, 0, length);
-                }
-                status = inspect(bytes.toByteArray());
-            } catch (IOException | SecurityException error) {
-                status = "Falha ao ler o SFO. Selecione um arquivo acessível de até 64 KiB.";
-            }
-            String message = status;
-            runOnUiThread(() -> result.setText(message));
+            try { status = library.inspectFile(uri); }
+            catch (IOException | RuntimeException e) { status = "Falha ao ler o SFO (limite de 64 KiB)."; }
+            String result = status;
+            runOnUiThread(() -> {
+                if (!isFinishing() && !isDestroyed()) new AlertDialog.Builder(this).setTitle("param.sfo")
+                        .setMessage(result).setPositiveButton("Fechar", null).show();
+            });
         });
     }
 
     @Override protected void onSaveInstanceState(Bundle state) {
         super.onSaveInstanceState(state);
-        state.putString("result", result.getText().toString());
+        state.putBoolean("system", system);
     }
 
     @Override protected void onDestroy() {

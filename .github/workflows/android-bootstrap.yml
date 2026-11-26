@@ -32,3 +32,22 @@ jobs:
           name: driveclub-android-arm64-debug
           path: android/build/outputs/apk/debug/*.apk
           if-no-files-found: error
+      - name: Build emulator test APK
+        run: ./gradlew assembleDebug -PlauncherTestAbi=x86_64
+        working-directory: android
+      - name: Enable emulator acceleration
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Exercise launcher on Android 15
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          arch: x86_64
+          target: google_apis
+          script: bash android/smoke-launcher.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: driveclub-launcher-preview
+          path: out/launcher-preview/*.png

@@ -234,3 +234,10 @@ The ARM64 launcher layout and Gradle wrapper follow
 [ShadowOfTheColossus-Android-Aot](https://github.com/erickmendes22/ShadowOfTheColossus-Android-Aot).
 The staged CPU and presentation bring-up follows the
 [inFAMOUS Android plan](https://github.com/erickmendes22/iss_android/blob/main/docs/ANDROID_PORT.md).
+
+The mobile garage uses the desktop launcher's cover, wordmark and app icon.
+Biblioteca retains read-only access to the base and update directories through the
+Android document picker. It checks for game000.dat and reads sce_sys/param.sfo in
+place. Sistema shows the Vulkan device/driver API and live steering and pedal axes
+from a connected controller. CI saves screenshots from an Android 15 x86_64
+emulator separately from the ARM64 debug APK.
