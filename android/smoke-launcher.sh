@@ -24,7 +24,14 @@ PY
 node 'Atualização 1.28'
 adb exec-out screencap -p > out/launcher-preview/biblioteca.png
 node 'Escolher pasta  ›' tap
-adb shell dumpsys activity activities | grep 'mResumedActivity\|topResumedActivity' | grep -i documentsui
+# Wait for DocumentsUI to become visible after the asynchronous activity transition.
+for attempt in 1 2 3 4 5; do
+    adb shell uiautomator dump /sdcard/launcher-window.xml >/dev/null
+    adb pull /sdcard/launcher-window.xml /tmp/launcher-window.xml >/dev/null
+    if grep -qi 'package="[^"]*documentsui"' /tmp/launcher-window.xml; then break; fi
+    sleep 1
+done
+grep -qi 'package="[^"]*documentsui"' /tmp/launcher-window.xml
 adb shell input keyevent BACK
 node 'Sistema' tap
 node 'Processador gráfico'
