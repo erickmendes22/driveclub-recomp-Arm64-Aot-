@@ -215,17 +215,21 @@ To record a new profile after the code has changed a lot: build with `BB_PGO=gen
 
 ## Android ARM64 (Bionic and FEX)
 
-The Android target integrates the local preparer, the Driveclub loader/HLE, FEXCore,
-and the existing shadPS4-based renderer. It targets `arm64-v8a`, Android 11/API 30
-or later, using Bionic throughout. Building the APK or passing synthetic CPU tests
-does not establish that the original game reaches its menu or gameplay; that
-requires an Android device run with the user's game files and its startup log.
+The Android 0.5 target integrates the local preparer, Driveclub loader/HLE, FEXCore,
+the existing shadPS4-based renderer, local FPKG installation, a bundled Turnip
+selector and analogue touch controls. It targets `arm64-v8a`, Android 11/API 30
+or later, using Bionic throughout. The new 0.5 Android integration tests are
+awaiting CI validation. Building the APK or passing synthetic tests does not
+establish that the original game reaches its menu or gameplay; that requires an
+Android device run with the user's game files and its startup log.
 
 ### Build
 
 Use a Linux x86_64 build host with JDK 17 or 21, Android SDK 35, Build Tools 35.0.0,
 NDK **29.0.14206865**, and CMake **3.31.6**. The scripts also need Git, a host C/C++
-compiler, Ninja, pkg-config, Python 3, curl, tar, make, Perl and unzip. Install the
+compiler, Ninja, pkg-config, Python 3, curl, tar, make, Perl, unzip and Rustup. The
+PKG helper installs and explicitly selects **Rust 1.85.0** with the locked Cargo
+dependencies, independently of the host's default Rust version. Install the
 Android packages through Android Studio or `sdkmanager`:
 
     sdkmanager "platforms;android-35" "build-tools;35.0.0" "ndk;29.0.14206865" "cmake;3.31.6"
@@ -238,14 +242,22 @@ From the repository root:
     export CMAKE_BUILD_PARALLEL_LEVEL=3
     android/tools/build-fex.sh
     android/tools/fetch-gpu-deps.sh
+    bash android/tools/build-pkg.sh --abi arm64-v8a
+    python3 android/tools/fetch-turnip.py
     (cd android && ./gradlew assembleDebug)
     python3 android/tools/verify-apk.py android/build/outputs/apk/debug/driveclub-android-debug.apk
 
 `build-fex.sh` builds `out/android-fex/build/libbbcpu.so`. Despite its name,
 `fetch-gpu-deps.sh` also cross-compiles the renderer, media and network dependencies
 under `out/android-gpu/`; it keeps host shader/protobuf tools separate from Android
-libraries. Gradle then compiles and links the game runtime and packages it with the
-launcher and FEX. No game files are needed to build the APK. Install it with
+libraries. `build-pkg.sh` creates
+`out/android-pkg/aarch64-linux-android/release/libdriveclub_pkg_core.a`; CMake links
+it into `libdriveclub_pkg.so` through JNI. No extractor executable is launched on
+Android. `fetch-turnip.py` verifies the exact upstream ZIP and stages it under
+`out/android-driver/assets/`; an offline copy can be supplied with
+`--archive /path/to/Turnip_Gen8_V39_Patched.zip` and undergoes the same checks.
+Gradle compiles and packages the launcher, runtime, FEX, installer and driver
+loader. No game files are needed to build the APK. Install it with
 `cd android && ./gradlew installDebug` or `adb install -r` using the APK path above.
 
 The **Android Bionic FEX runtime** GitHub Actions workflow
@@ -255,23 +267,86 @@ It builds and audits the APK and archives it as
 
 ### Local preparation and runtime
 
-Select the base and update directories in **Biblioteca**. The app retains read-only
-Storage Access Framework (SAF) grants and runs the shared `launcher/prepare.cpp`
-preparer on the device. The executable and modules are staged in a private generation;
-the resulting boot, content and patch files are created there. No prepared boot image
-is downloaded or distributed with the APK. `game000.dat` stays in the selected folder:
-preparation uses an open descriptor, and runtime reads/seeks use native descriptors
-opened through SAF. The provider must support seekable files; use a local device folder
-rather than a provider that exposes only streams.
+In **Biblioteca**, select **Pasta do jogo** containing `game000.dat`. A folder
+already merged with update 1.28 needs no second selection: the effective update
+source is the game folder itself. **Atualização separada (opcional)** supplies
+an update-first overlay only when the update lives elsewhere. Folder sources and
+locally installed PKGs share the same read-only runtime file API.
+
+The app retains read-only Storage Access Framework (SAF) grants and runs the
+shared `launcher/prepare.cpp` preparer on the device. The executable and modules
+are staged in a private generation; boot, content and patch files are created
+there. No prepared boot image is downloaded or distributed with the APK.
+`game000.dat` stays in its selected folder: preparation uses an open descriptor,
+and runtime reads/seeks use native descriptors opened through SAF. The provider
+must support seekable files; use a local device folder rather than a provider
+that exposes only streams.
 
 The last complete generation remains available if preparation fails. Saves and user
 data live in the separate private `driveclub/user` directory, outside `local-*`
 generations, so replacing a prepared generation does not remove saves.
 
+### Local PKG installation and recovery
+
+Use **Instalar / atualizar por PKG** to inspect a local package and confirm its
+title, version, type and required extraction space. The installer accepts
+Driveclub **CUSA00093**; the launcher requires update **1.28** for this runtime.
+A base PKG may be installed first, followed by its update. The input descriptor
+is read directly, and the package is not copied into private storage before
+extraction.
+
+Extraction writes a new `.pkg-staging-*` directory under the app's private
+`driveclub/installed` root. Cancellation and extraction errors remove only that
+staging; the next installation also cleans staging left by a terminated process.
+Completed extraction is renamed atomically to a `base-*` or `update-*` generation
+before the library selection is published. An update remains a separate overlay
+and does not copy the base `game000.dat`.
+
+The previous selection and installed files remain available until the new local
+preparation succeeds. **Restaurar seleção anterior** restores that selection if
+preparation fails; after success, unused old package generations can be reclaimed.
+Cleanup failures are logged and do not turn a published success into a failure.
+Saves remain in `driveclub/user` throughout.
+
+The backend parses real FPKG key envelopes, AES-encrypted PFS and PFSC/zlib data
+using the vendored `orbis-pkg`/`orbis-pfs` libraries. It supports the public fake
+package keysets; it does not supply console-specific retail keys. Unsupported
+encryption, delta patches needing a base filesystem, multiple PFS images and
+64-bit PFS inode layouts are rejected. Package paths and parser allocation sizes
+are bounded, and special files/path traversal are rejected. PFS signature/hash
+verification is not provided by this parser; a successful metadata inspection
+is not a full-package integrity proof. Files and package offsets above 4 GiB
+are supported within the integration's size limits.
+
+### Graphics selection and controls
+
+The ARM64 build defaults to **Turnip Gen8 V39-patched**. In **Sistema → Processador
+gráfico → Escolher driver**, select the included Turnip or **Driver do sistema**.
+The x86_64 launcher test build defaults to the system driver and cannot load the
+ARM64 Turnip library. The app bundles the exact `Turnip_Gen8_V39_Patched.zip`
+release asset as `assets/drivers/turnip-gen8-v39-patched/driver.zip`, preserving
+the upstream ZIP and checking its SHA-256 before installation. It contains
+`libvulkan_freedreno.so`; it is a Vulkan HAL loaded through the pinned AdrenoTools
+integration, not a replacement system `libvulkan.so`.
+
+The launcher probe and game renderer use the selected loader, including direct
+Vulkan calls. A failed custom-driver load is reported and blocks that choice;
+it never silently switches to the system driver. Choosing the system driver
+explicitly remains available. Bundling Turnip does not establish compatibility
+with a particular GPU or Android version; the exact asset's ABI note and release
+metadata differ, as recorded in its `NOTICE.txt`.
+
+On-screen racing controls provide analogue steering, separately adjustable
+accelerator/brake pedals and simultaneous multitouch. The menu toggle exposes
+the controller buttons and menu/navigation controls; switching layouts, losing
+focus or cancelling a touch stream releases held inputs. Physical Android
+gamepads also feed the pad backend. **Sistema → Controles do jogo → Testar
+controle na tela** opens the same controls with live values without starting
+the game.
+
 `GameActivity` runs in the dedicated `:runtime` process. Its JNI library enters the
 loader, FEX executes the original x86-64 code, and the renderer presents through
-`ANativeWindow` and Vulkan. Audio uses AAudio; touch buttons and Android gamepad
-buttons/axes feed the pad backend. A native exit or crash is contained in that
+`ANativeWindow` and Vulkan. Audio uses AAudio. A native exit or crash is contained in that
 process so the garage can be reopened. Android IME dialogs, steering-wheel support,
 force feedback and controller vibration are not implemented in this backend.
 
@@ -312,7 +387,40 @@ Run the host contract tests from the repository root without game files:
 These cover metadata, large-file descriptor I/O, directory/stat handling, read-only
 content, save paths, pad input, and virtual-range naming/bounds/backing offsets.
 `verify-apk.py` audits the actual packaged ARM64 ELF files, JNI/CPU exports, Android
-dependency closure and 16 KiB load alignment; it also rejects packaged game data.
+dependency closure, selected-driver linkage, the exact bundled Turnip asset and
+16 KiB load alignment; it also rejects packaged game data.
+
+Run the real-format package tests and generate the Android test assets:
+
+    bash android/tools/build-pkg.sh --test-only
+    bash android/tools/build-pkg.sh --fixtures
+    bash android/tools/test-vulkan-dispatch.sh
+
+The seven Rust tests exercise encrypted/compressed extraction, update overlays,
+wrong title/unsupported formats, parser bounds, cancellation/corruption rollback,
+offsets beyond 4 GiB and changed-input rejection. They passed locally during 0.5
+development. The generator writes three 384 KiB synthetic PKGs to
+`out/pkg-fixtures`: base, update and an extraction-stage corrupt case. These
+contain no game code and are included only in the instrumentation test APK.
+The Vulkan dispatch test uses controlled host loaders to check selected-driver
+routing, direct-call forwarding, switching/lifetime and blocked silent fallback;
+it does not run the actual Turnip GPU driver.
+
+For the Android 15 x86_64 emulator integration tests, build the matching installer
+archive and test APK (the game runtime is intentionally ARM64-only):
+
+    bash android/tools/build-pkg.sh --abi x86_64
+    python3 android/tools/fetch-turnip.py
+    (cd android && ./gradlew assembleDebug assembleDebugAndroidTest -PlauncherTestAbi=x86_64)
+    (cd android && ./gradlew connectedDebugAndroidTest -PlauncherTestAbi=x86_64)
+
+Run `--fixtures` first as above. The six instrumented tests comprise three real
+touch-stream/control tests and three JNI package/source tests: simultaneous
+steering and pedals, independent pointer release, focus/cancel/menu transitions,
+base/update publication, cancellation/corruption recovery, saves preservation and
+a unified folder with no separate update. These new 0.5 tests await their CI run;
+they do not execute the original game or validate device rendering. The workflow
+also runs the launcher/log-export smoke checks through `android/smoke-launcher.sh`.
 
 Build the FEX ABI test against the backend extracted from the APK:
 
@@ -344,8 +452,8 @@ code invalidation and the production low-address allocator. QEMU execution,
 native ARM64 execution and the launcher emulator test are separate checks; none
 runs the original game or validates Vulkan rendering. CI runs the FEX test against
 the backend extracted from its own APK. Its Android 15 x86_64 emulator job builds
-with `-PlauncherTestAbi=x86_64` for launcher/diagnostic checks only; that APK does
-not contain the ARM64 game runtime.
+with `-PlauncherTestAbi=x86_64` for launcher, controls and PKG/source integration;
+that APK does not contain the ARM64 game runtime.
 
 ### Source bases
 
@@ -359,3 +467,20 @@ at `562f993c10b022aaf69be0271cd1c3cd287b040c`. FEX itself is pinned to
 at `b3a7c3d5e916cf8f4622192c0faa9383ebd77c00`; its dependency-build approach also
 informs the Android renderer build. The launcher layout and Gradle wrapper follow
 [ShadowOfTheColossus-Android-Aot](https://github.com/erickmendes22/ShadowOfTheColossus-Android-Aot).
+
+The PKG/PFS parser is `videobitva/orbis` at
+`13f1294a87a53d54f82feec56acbfd03f50667a9`, the revision used by the GoW3 Bionic
+PKG build. `android/pkg/vendor/SOURCE.md` records provenance and local hardening;
+the MIT and Apache-2.0 license texts are beside it. AdrenoTools is pinned to
+`8fae8ce254dfc1344527e05301e43f37dea2df80` and liblinkernsbypass to
+`aa3975893d83ef1bc84c321ec60c65fbf1287887`; source changes and BSD-2-Clause licenses
+are recorded in `android/third_party/adrenotools/UPSTREAM.md` and that source tree.
+
+The Turnip binary is StevenMXZ's `v39` release asset **721176461**, SHA-256
+`bd457b30f195cf93a334b5302c221b1b5cb59c79c485935decf95d560a38c8a2`.
+Its Mesa identifier is `27.0.0-devel (git-2648b2059f)`.
+`android/third_party/turnip-gen8-v39-patched/{package.json,provenance.json,NOTICE.txt}`
+records the exact asset, upstream source links and compatibility caveats; Mesa,
+LLVM/libc++ and publisher recipe license notices are included in the same
+directory. The release is pinned by binary hash; the publisher's recipe is not
+claimed to reproduce it byte for byte.

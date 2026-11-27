@@ -68,7 +68,9 @@ final class LocalGame {
         if (!refresh && !active.isEmpty() && base.toString().equals(state.getString("base", ""))
                 && update.toString().equals(state.getString("update", ""))
                 && stamp.equals(state.getString("sourceStamp", "")) && complete(root.resolve(active))) {
+            if (!library.matches(base, update)) return null;
             log.write("Preparação local", "Reutilizando arquivos preparados neste aparelho");
+            library.finishPreparation(log);
             return root.resolve(active);
         }
         // Remove interrupted staging directories; preserve the last complete generation on failure.
@@ -119,7 +121,13 @@ final class LocalGame {
                     .putString("sourceStamp", stamp).commit();
             if (!published) throw new IOException("Falha ao salvar estado local");
             log.write("Preparação local", "Módulos vinculados e patches compilados no aparelho");
-            if (!active.isEmpty()) remove(root.resolve(active));
+            library.finishPreparation(log);
+            if (!active.isEmpty()) {
+                try { remove(root.resolve(active)); }
+                catch (IOException | java.io.UncheckedIOException e) {
+                    log.write("Preparação local", "Nova preparação ativa; limpeza da anterior pendente: " + e.getMessage());
+                }
+            }
             return next;
         } finally {
             if (!published) remove(next);

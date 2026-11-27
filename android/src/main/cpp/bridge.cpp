@@ -1,4 +1,5 @@
 #include "prepare.h"
+#include "vulkan_driver.h"
 #include <jni.h>
 #if defined(__aarch64__)
 #include "guest_cpu.h"
@@ -13,28 +14,7 @@ extern "C" decltype(&guest_cpu_call_xmm) const driveclub_fex_call_xmm = guest_cp
 
 extern "C" JNIEXPORT jstring JNICALL
 Java_org_driveclub_port_PortActivity_probeGraphics(JNIEnv* env, jclass) {
-    VkInstanceCreateInfo info{};
-    info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
-    VkInstance instance;
-    std::string status = "Vulkan indisponível.";
-    if (vkCreateInstance(&info, nullptr, &instance) == VK_SUCCESS) {
-        uint32_t count = 0;
-        if (vkEnumeratePhysicalDevices(instance, &count, nullptr) == VK_SUCCESS && count > 0) {
-            VkPhysicalDevice device;
-            count = 1;
-            VkResult result = vkEnumeratePhysicalDevices(instance, &count, &device);
-            if ((result == VK_SUCCESS || result == VK_INCOMPLETE) && count) {
-                VkPhysicalDeviceProperties gpu{};
-                vkGetPhysicalDeviceProperties(device, &gpu);
-                std::string name(gpu.deviceName);
-                for (char& c : name) if (static_cast<unsigned char>(c) > 127) c = '?';
-                status = name + "  ·  Vulkan " + std::to_string(VK_VERSION_MAJOR(gpu.apiVersion))
-                         + "." + std::to_string(VK_VERSION_MINOR(gpu.apiVersion));
-            }
-        }
-        vkDestroyInstance(instance, nullptr);
-    }
-    return env->NewStringUTF(status.c_str());
+    return env->NewStringUTF(driveclub_vk_probe());
 }
 
 extern "C" JNIEXPORT jstring JNICALL

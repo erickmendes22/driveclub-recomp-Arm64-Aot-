@@ -114,6 +114,7 @@ final class PkgInstaller {
                 if (progress != null && !progress.update(0, current.extractedBytes, "Verificando PKG"))
                     throw new CancelledException();
                 Files.createDirectories(installed);
+                cleanInterrupted(installed);
                 staging = Files.createTempDirectory(installed, ".pkg-staging-");
                 extracted = response(extractNative(fd.getFd(), staging.toString(), current.fingerprint, progress));
                 if (!extracted.fingerprint.equals(current.fingerprint))
@@ -138,6 +139,15 @@ final class PkgInstaller {
                     else throw cleanup;
                 }
             }
+        }
+    }
+
+    private static void cleanInterrupted(Path installed) throws IOException {
+        // Installation is serialized in this process. These private temporary
+        // roots can only remain after an interrupted earlier process; published
+        // base-/update- roots are deliberately outside this cleanup pattern.
+        try (java.nio.file.DirectoryStream<Path> children = Files.newDirectoryStream(installed, ".pkg-staging-*")) {
+            for (Path child : children) deleteStaging(child);
         }
     }
 

@@ -226,6 +226,11 @@ public final class PortActivity extends Activity {
             });
             installText = text(packageStatus, 14, MUTED, false);
             packages.addView(installText);
+            if (library.canRestorePrevious())
+                sourceActions.add(action(packages, "Restaurar seleção anterior", () -> {
+                    try { library.restorePrevious(); prepared = null; body(); prepareLocal(false); }
+                    catch (IOException e) { notice("PKG", e.getMessage()); }
+                }));
             if (packageBusy) {
                 installProgress = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
                 installProgress.setMax(1000);
@@ -274,6 +279,7 @@ public final class PortActivity extends Activity {
                                         "Pronto para iniciar. Os arquivos foram preparados neste aparelho." :
                                         "Preparação concluída. O renderizador ainda não suporta o tamanho de página deste aparelho.") :
                                 "Preparação concluída. Esta compilação de teste não contém o runtime ARM64.");
+                        body();
                     }
                 });
             } catch (IOException | RuntimeException e) {

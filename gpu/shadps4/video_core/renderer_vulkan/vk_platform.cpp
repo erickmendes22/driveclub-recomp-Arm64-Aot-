@@ -26,6 +26,9 @@
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vk_dlss.h"
 #include "video_core/renderer_vulkan/vk_neural_rendering.h"
+#ifdef __ANDROID__
+#include "vulkan_driver.h"
+#endif
 
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
@@ -288,13 +291,16 @@ vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool e
 #endif
 
 #ifdef __ANDROID__
-    // Android has libvulkan.so, never the desktop libvulkan.so.1 soname.
-    static vk::detail::DynamicLoader dl("libvulkan.so");
+    const auto selected_gipa = driveclub_vk_get_instance_proc_addr();
+    ASSERT_MSG(selected_gipa, "Selected Android Vulkan loader is unavailable: {}",
+               driveclub_vk_last_error());
+    LOG_INFO(Render_Vulkan, "Android driver: {}", driveclub_vk_description());
+    VULKAN_HPP_DEFAULT_DISPATCHER.init(selected_gipa);
 #else
     static vk::detail::DynamicLoader dl;
-#endif
     VULKAN_HPP_DEFAULT_DISPATCHER.init(
         dl.getProcAddress<PFN_vkGetInstanceProcAddr>("vkGetInstanceProcAddr"));
+#endif
 
     const auto [available_version_result, available_version] =
         VULKAN_HPP_DEFAULT_DISPATCHER.vkEnumerateInstanceVersion

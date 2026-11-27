@@ -11,11 +11,14 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Comparator;
 import java.util.Objects;
+import java.util.HashSet;
+import java.util.Set;
 import java.util.stream.Stream;
 
 /** A game folder can already include its update; a separate update is an optional overlay. */
 final class GameLibrary {
     static final String BASE = "base", UPDATE = "update";
+    private static final String PREVIOUS_BASE = "previous-base", PREVIOUS_UPDATE = "previous-update", CLEANUP = "pending-cleanup";
     private final Context context;
     private final SharedPreferences prefs;
 
@@ -44,6 +47,7 @@ final class GameLibrary {
         context.getContentResolver().takePersistableUriPermission(tree, Intent.FLAG_GRANT_READ_URI_PERMISSION);
         Uri oldBase = folder(BASE), oldUpdate = folder(UPDATE);
         SharedPreferences.Editor change = prefs.edit().putString(key, tree.toString());
+        rememberSelection(change, oldBase, oldUpdate);
         // A newly selected game is self-contained unless the user adds an overlay afterwards.
         if (BASE.equals(key)) change.remove(UPDATE);
         if (!change.commit()) throw new IOException("Não foi possível salvar a pasta selecionada");
@@ -53,12 +57,15 @@ final class GameLibrary {
 
     void clearUpdate() throws IOException {
         Uri old = folder(UPDATE);
-        if (!prefs.edit().remove(UPDATE).commit()) throw new IOException("Falha ao alterar a atualização");
+        SharedPreferences.Editor change = prefs.edit().remove(UPDATE);
+        rememberSelection(change, folder(BASE), old);
+        if (!change.commit()) throw new IOException("Falha ao alterar a atualização");
         releaseUnusedGrant(old);
     }
 
     private void releaseUnusedGrant(Uri old) {
-        if (old == null || !"content".equals(old.getScheme()) || old.equals(folder(BASE)) || old.equals(folder(UPDATE))) return;
+        if (old == null || !"content".equals(old.getScheme()) || old.equals(folder(BASE)) || old.equals(folder(UPDATE))
+                || old.equals(folder(PREVIOUS_BASE)) || old.equals(folder(PREVIOUS_UPDATE))) return;
         try {
             context.getContentResolver().releasePersistableUriPermission(old, Intent.FLAG_GRANT_READ_URI_PERMISSION);
         } catch (SecurityException ignored) { /* The provider may already have revoked it. */ }
@@ -75,23 +82,73 @@ final class GameLibrary {
         SharedPreferences.Editor change = prefs.edit();
         if (result.isUpdate) change.putString(UPDATE, uri.toString());
         else change.putString(BASE, uri.toString()).remove(UPDATE);
+        rememberSelection(change, oldBase, oldUpdate);
         if (!change.commit()) throw new IOException("Não foi possível ativar o PKG instalado");
         releaseUnusedGrant(oldBase);
         releaseUnusedGrant(oldUpdate);
-        removeUnusedInstallation(oldBase, log);
-        removeUnusedInstallation(oldUpdate, log);
     }
 
-    private void removeUnusedInstallation(Uri previous, PortLog log) {
+    private void rememberSelection(SharedPreferences.Editor change, Uri oldBase, Uri oldUpdate) {
+        Set<String> cleanup = new HashSet<>(prefs.getStringSet(CLEANUP, java.util.Collections.emptySet()));
+        remember(cleanup, oldBase);
+        remember(cleanup, oldUpdate);
+        change.putStringSet(CLEANUP, cleanup);
+        if (folder(PREVIOUS_BASE) == null && oldBase != null) {
+            change.putString(PREVIOUS_BASE, oldBase.toString());
+            if (oldUpdate == null) change.remove(PREVIOUS_UPDATE);
+            else change.putString(PREVIOUS_UPDATE, oldUpdate.toString());
+        }
+    }
+
+    private static void remember(Set<String> cleanup, Uri uri) {
+        if (uri != null && "file".equals(uri.getScheme())) cleanup.add(uri.toString());
+    }
+
+    boolean canRestorePrevious() { return folder(PREVIOUS_BASE) != null; }
+
+    void restorePrevious() throws IOException {
+        Uri base = folder(PREVIOUS_BASE), update = folder(PREVIOUS_UPDATE);
+        if (base == null) throw new IOException("Não há instalação anterior para restaurar");
+        Set<String> cleanup = new HashSet<>(prefs.getStringSet(CLEANUP, java.util.Collections.emptySet()));
+        Uri currentBase = folder(BASE), currentUpdate = folder(UPDATE);
+        remember(cleanup, currentBase);
+        remember(cleanup, currentUpdate);
+        SharedPreferences.Editor change = prefs.edit().putString(BASE, base.toString()).putStringSet(CLEANUP, cleanup)
+                .remove(PREVIOUS_BASE).remove(PREVIOUS_UPDATE);
+        if (update == null) change.remove(UPDATE); else change.putString(UPDATE, update.toString());
+        if (!change.commit()) throw new IOException("Não foi possível restaurar a seleção anterior");
+        releaseUnusedGrant(currentBase);
+        releaseUnusedGrant(currentUpdate);
+    }
+
+    /** Old package generations are reclaimed only after the new game preparation has succeeded. */
+    void finishPreparation(PortLog log) {
+        Uri previousBase = folder(PREVIOUS_BASE), previousUpdate = folder(PREVIOUS_UPDATE);
+        if (!prefs.edit().remove(PREVIOUS_BASE).remove(PREVIOUS_UPDATE).commit()) {
+            log.write("PKG", "Preparação concluída; a limpeza da instalação anterior ficará para depois");
+            return;
+        }
+        Set<String> failed = new HashSet<>();
+        for (String uri : new HashSet<>(prefs.getStringSet(CLEANUP, java.util.Collections.emptySet())))
+            if (!removeUnusedInstallation(Uri.parse(uri), log)) failed.add(uri);
+        prefs.edit().putStringSet(CLEANUP, failed).apply();
+        releaseUnusedGrant(previousBase);
+        releaseUnusedGrant(previousUpdate);
+    }
+
+    private boolean removeUnusedInstallation(Uri previous, PortLog log) {
         if (previous == null || !"file".equals(previous.getScheme())
-                || previous.equals(folder(BASE)) || previous.equals(folder(UPDATE))) return;
+                || previous.equals(folder(BASE)) || previous.equals(folder(UPDATE))) return true;
         try {
+            if (previous.getPath() != null && !Files.exists(new java.io.File(previous.getPath()).toPath())) return true;
             Path root = RuntimeFiles.checkedInstalledRoot(context, previous);
             try (Stream<Path> files = Files.walk(root)) {
                 for (Path path : (Iterable<Path>) files.sorted(Comparator.reverseOrder())::iterator) Files.delete(path);
             }
-        } catch (IOException e) {
+            return true;
+        } catch (IOException | java.io.UncheckedIOException | SecurityException e) {
             log.write("PKG", "Instalação ativada; não foi possível limpar a anterior: " + e.getMessage());
+            return false;
         }
     }
 

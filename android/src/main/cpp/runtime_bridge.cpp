@@ -2,6 +2,7 @@
 #include "gpu/bbgpu.h"
 #include <android/native_window_jni.h>
 #include <jni.h>
+#include "vulkan_driver.h"
 #include <atomic>
 #include <cerrno>
 #include <cstdio>
@@ -245,6 +246,11 @@ extern "C" JNIEXPORT jint JNICALL Java_org_driveclub_port_GameActivity_runNative
     if (fd > STDERR_FILENO) close(fd);
     setvbuf(stdout, nullptr, _IONBF, 0);
     setvbuf(stderr, nullptr, _IONBF, 0);
+    if (!driveclub_vk_is_configured()) {
+        std::fprintf(stderr, "Android: driver Vulkan não configurado: %s\n", driveclub_vk_last_error());
+        return EINVAL;
+    }
+    std::fprintf(stderr, "Android: driver Vulkan selecionado: %s\n", driveclub_vk_description());
     const long host_page_size = sysconf(_SC_PAGESIZE);
     std::printf("Driveclub Android runtime: ARM64 Bionic + FEX; pid=%d page-size=%ld\n", getpid(), host_page_size);
     if (host_page_size != 4096) {

@@ -15,8 +15,8 @@ set(ENV{PKG_CONFIG_LIBDIR} "${DRIVECLUB_ANDROID_DEPS}/lib/pkgconfig:${DRIVECLUB_
 set(ENV{PKG_CONFIG_PATH} "$ENV{PKG_CONFIG_LIBDIR}")
 unset(ENV{PKG_CONFIG_SYSROOT_DIR})
 
-# The NDK Vulkan loader is used with newer, pinned C and Hpp headers. Do not
-# accidentally select an x86-64 libvulkan from the build host.
+# Use pinned C and Hpp headers. Vulkan::Vulkan is supplied by the Android driver
+# selector, so every renderer consumer uses the explicitly selected loader.
 set(Vulkan_INCLUDE_DIR "${DRIVECLUB_ANDROID_DEPS}/include" CACHE PATH "Vulkan headers" FORCE)
 set(OPENSSL_ROOT_DIR "${DRIVECLUB_ANDROID_DEPS}")
 set(OPENSSL_USE_STATIC_LIBS TRUE)

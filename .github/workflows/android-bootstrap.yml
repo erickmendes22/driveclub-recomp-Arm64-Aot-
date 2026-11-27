@@ -18,6 +18,7 @@ permissions:
 jobs:
   apk:
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - name: Test shared metadata reader
@@ -51,6 +52,20 @@ jobs:
           key: android-bionic-r29-${{ hashFiles('android/tools/fetch-gpu-deps.sh', 'android/tools/build-fex.sh', 'cpu/**') }}
       - name: Cross-compile Driveclub loader and HLE for Bionic
         run: ANDROID_NDK_HOME="$ANDROID_HOME/ndk/29.0.14206865" android/tools/build-runtime-core.sh
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            out/pkg-tests
+            out/android-pkg
+          key: android-pkg-rust185-arm64-${{ hashFiles('android/pkg/**', 'android/tools/build-pkg.sh') }}
+      - name: Test PKG extraction and build the ARM64 installer
+        run: |
+          bash android/tools/build-pkg.sh --test-only
+          ANDROID_NDK_HOME="$ANDROID_HOME/ndk/29.0.14206865" bash android/tools/build-pkg.sh --abi arm64-v8a
+      - name: Bundle the pinned Turnip Gen8 V39-patched driver
+        run: python3 android/tools/fetch-turnip.py
       - name: Build CPU and renderer dependencies for Android Bionic
         run: |
           export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/29.0.14206865"
@@ -68,6 +83,8 @@ jobs:
             tail -100 out/build-logs/gpu-dependencies.txt
             exit 1
           fi
+      - name: Test selected Vulkan dispatch and driver switching
+        run: bash android/tools/test-vulkan-dispatch.sh
       - run: ./gradlew assembleDebug
         working-directory: android
       - name: Verify packaged Bionic runtime and dependency closure
@@ -94,6 +111,7 @@ jobs:
 
   launcher:
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
@@ -103,8 +121,21 @@ jobs:
       - uses: android-actions/setup-android@v3
         with:
           packages: 'platforms;android-35 build-tools;35.0.0 ndk;29.0.14206865 cmake;3.31.6'
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            out/pkg-tests
+            out/android-pkg
+          key: android-pkg-rust185-x86_64-${{ hashFiles('android/pkg/**', 'android/tools/build-pkg.sh') }}
+      - name: Prepare driver assets and the emulator PKG installer
+        run: |
+          python3 android/tools/fetch-turnip.py
+          bash android/tools/build-pkg.sh --fixtures
+          ANDROID_NDK_HOME="$ANDROID_HOME/ndk/29.0.14206865" bash android/tools/build-pkg.sh --abi x86_64
       - name: Build emulator test APK
-        run: ./gradlew assembleDebug -PlauncherTestAbi=x86_64
+        run: ./gradlew assembleDebug assembleDebugAndroidTest -PlauncherTestAbi=x86_64
         working-directory: android
       - name: Enable emulator acceleration
         run: |
@@ -119,9 +150,10 @@ jobs:
           target: google_apis
           script: bash android/smoke-launcher.sh
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: driveclub-launcher-preview
-          path: out/launcher-preview/*.png
+          path: out/launcher-preview/
 
   fex:
     needs: apk

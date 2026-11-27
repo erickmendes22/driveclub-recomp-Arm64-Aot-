@@ -8,6 +8,8 @@ renderer currently permits game execution only with 4 KiB host pages.
 from __future__ import annotations
 
 import argparse
+import hashlib
+import io
 import json
 from pathlib import Path
 import re
@@ -21,10 +23,26 @@ REQUIRED_EXPORTS = {
         "Java_org_driveclub_port_PortActivity_probeGraphics",
         "Java_org_driveclub_port_PortActivity_inspect",
         "Java_org_driveclub_port_LocalGame_prepareNative",
+        "Java_org_driveclub_port_DriverManager_configureNative",
     },
     "libdriveclub_game.so": {
         "Java_org_driveclub_port_GameActivity_runNative",
         "Java_org_driveclub_port_GameActivity_inputNative",
+        "Java_org_driveclub_port_DriverManager_configureNative",
+    },
+    "libdriveclub_vulkan.so": {
+        "driveclub_vk_configure", "driveclub_vk_is_configured",
+        "driveclub_vk_get_instance_proc_addr", "driveclub_vk_probe",
+        "driveclub_vk_description", "driveclub_vk_last_error",
+        "driveclub_vk_generation", "driveclub_vk_lookup", "driveclub_vk_missing",
+        "__wrap_vkCreateInstance", "__wrap_vkDestroyInstance", "__wrap_vkGetInstanceProcAddr",
+    },
+    "libadrenotools.so": {"adrenotools_open_libvulkan", "adrenotools_custom_driver_loaded"},
+    "libhook_impl.so": {"init_hook_param", "hook_android_dlopen_ext", "hook_android_load_sphal_library"},
+    "libmain_hook.so": {"android_dlopen_ext", "android_load_sphal_library"},
+    "libdriveclub_pkg.so": {
+        "Java_org_driveclub_port_PkgInstaller_inspectNative",
+        "Java_org_driveclub_port_PkgInstaller_extractNative",
     },
     "libbbcpu.so": {
         "guest_cpu_init", "guest_cpu_code", "guest_cpu_code_changed",
@@ -47,6 +65,17 @@ DESKTOP_DEPENDENCY = re.compile(
     r"ld-linux|libSDL|libX11|libXext|libXrandr|libXfixes|libXcursor|libXinerama|"
     r"libXrender|libXi\.|libxcb|libxkbcommon)", re.IGNORECASE
 )
+TURNIP_ASSET = "assets/drivers/turnip-gen8-v39-patched/driver.zip"
+TURNIP_ZIP_SHA256 = "bd457b30f195cf93a334b5302c221b1b5cb59c79c485935decf95d560a38c8a2"
+TURNIP_LIBRARY = "libvulkan_freedreno.so"
+TURNIP_LIBRARY_SHA256 = "2db3c4601bc3f046596f86d9d189cb5cad693812f8c8c55fe1817ec90ea879ac"
+TURNIP_METADATA_SHA256 = "c40a758f839ecc340216ccd631221b57c00a4da5b7d6f2fb6ed60b67c19d1683"
+# These are HAL namespace dependencies of the exact driver asset, not additional
+# public NDK libraries allowed for the app's ordinary DT_NEEDED closure.
+TURNIP_HAL_LIBRARIES = {
+    "libhardware.so", "liblog.so", "libnativewindow.so", "libsync.so",
+    "libm.so", "libz.so", "libdl.so", "libc.so",
+}
 
 
 class AuditError(ValueError):
@@ -71,7 +100,8 @@ def string_at(table: bytes, offset: int) -> str:
     return table[offset:end].decode("utf-8", "strict")
 
 
-def inspect_elf(data: bytes, name: str) -> dict:
+def inspect_elf(data: bytes, name: str, *, android_api_ceiling: int = 30,
+                required_exports: set[str] | None = None) -> dict:
     require(len(data) >= 64 and data[:4] == b"\x7fELF", f"{name}: not an ELF file")
     require(data[4:7] == b"\x02\x01\x01", f"{name}: requires little-endian ELF64")
     (kind, machine, _, _, phoff, shoff, _, ehsize, phentsize, phnum,
@@ -138,7 +168,8 @@ def inspect_elf(data: bytes, name: str) -> dict:
             if owner == b"Android" and note_type == 1 and descsz >= 4:
                 android_api = struct.unpack_from("<I", desc)[0]
     require(android_api is not None, f"{name}: missing Android ABI identification note")
-    require(21 <= android_api <= 30, f"{name}: Android ABI note requires API {android_api}, APK minimum is 30")
+    require(21 <= android_api <= android_api_ceiling,
+            f"{name}: Android ABI note requires API {android_api}, allowed ceiling is {android_api_ceiling}")
 
     require(shentsize == 64 and 0 < shnum < 65535, f"{name}: unavailable section table for symbol audit")
     span(data, shoff, shentsize * shnum, f"{name} section headers")
@@ -162,13 +193,55 @@ def inspect_elf(data: bytes, name: str) -> dict:
                 exports.add(symbol)
             elif index == 0 and binding == 1:
                 imports.add(symbol)
-    missing = REQUIRED_EXPORTS.get(name, set()) - exports
+    missing = (REQUIRED_EXPORTS.get(name, set()) if required_exports is None else required_exports) - exports
     require(not missing, f"{name}: missing exports: {', '.join(sorted(missing))}")
     require("libc.so" in needed, f"{name}: missing Bionic libc.so dependency")
     return {
         "name": name, "machine": "AArch64", "android_api": android_api,
         "load_alignment": min(entry[7] for entry in loads), "needed": needed,
         "exports": exports, "strong_imports": imports,
+    }
+
+
+def audit_turnip(archive: zipfile.ZipFile) -> dict:
+    require(TURNIP_ASSET in archive.namelist(), "APK is missing the bundled Turnip Gen8 V39-patched ZIP")
+    package_data = archive.read(TURNIP_ASSET)
+    require(len(package_data) == 2705084, "Bundled Turnip ZIP size differs from the exact patched V39 release")
+    require(hashlib.sha256(package_data).hexdigest() == TURNIP_ZIP_SHA256,
+            "Bundled Turnip ZIP SHA-256 differs from the exact patched V39 release")
+    with zipfile.ZipFile(io.BytesIO(package_data)) as package:
+        require(sorted(package.namelist()) == [TURNIP_LIBRARY, "meta.json"],
+                "Bundled Turnip ZIP contains unexpected or duplicate entries")
+        raw_metadata = package.read("meta.json")
+        library = package.read(TURNIP_LIBRARY)
+    require(hashlib.sha256(raw_metadata).hexdigest() == TURNIP_METADATA_SHA256,
+            "Bundled Turnip metadata SHA-256 mismatch")
+    metadata = json.loads(raw_metadata)
+    require(metadata.get("schemaVersion") == 1 and metadata.get("name") == "Turnip Gen8 V39-patched"
+            and metadata.get("libraryName") == TURNIP_LIBRARY and metadata.get("vendor") == "Mesa"
+            and metadata.get("driverVersion") == "Vulkan 1.4.367" and metadata.get("minApi") == 28,
+            "Bundled Turnip metadata identifies a different driver")
+    require(len(library) == 8460728 and hashlib.sha256(library).hexdigest() == TURNIP_LIBRARY_SHA256,
+            "Bundled Turnip ELF SHA-256/size mismatch")
+    # The pinned external HAL was built with an API 34 note. It is an asset
+    # loaded by AdrenoTools, not an app JNI library linked at the API 30 minimum.
+    # Keep the ordinary JNI/library rule strict and check this exact asset separately.
+    elf = inspect_elf(library, TURNIP_LIBRARY, android_api_ceiling=34, required_exports={"HMI"})
+    require(elf["android_api"] == 34, "Bundled Turnip Android ABI note differs from the pinned asset")
+    require(set(elf["needed"]) == TURNIP_HAL_LIBRARIES,
+            "Bundled Turnip HAL dependencies differ from the pinned asset")
+    require("vkGetInstanceProcAddr" not in elf["exports"],
+            "Expected the pinned Android HAL driver, not a standalone Vulkan loader")
+    outer_metadata = TURNIP_ASSET.rsplit("/", 1)[0] + "/meta.json"
+    require(outer_metadata in archive.namelist() and archive.read(outer_metadata) == raw_metadata,
+            "Bundled driver metadata does not match the exact ZIP")
+    return {
+        "name": metadata["name"], "asset": TURNIP_ASSET, "zip_sha256": TURNIP_ZIP_SHA256,
+        "library": TURNIP_LIBRARY, "library_sha256": TURNIP_LIBRARY_SHA256,
+        "metadata_min_api": metadata["minApi"], "android_build_api_note": elf["android_api"],
+        "required_bionic_symbol_api": 30, "load_alignment": elf["load_alignment"],
+        "hal_entry": "HMI", "needed": elf["needed"],
+        "validation": "Exact bundled bytes and HAL ABI; device initialization is not proven by this audit",
     }
 
 
@@ -185,6 +258,24 @@ def audit(apk: Path) -> dict:
         require(not any(re.search(r"(?:^|/)(?:eboot\.bin|boot-linked\.bin|game\d+\.dat)$", name, re.I) for name in names),
                 "APK must prepare and open game data on-device; game executable/archive/prepared boot was packaged")
         results = {name: inspect_elf(archive.read(path), name) for name, path in sorted(present.items())}
+        for name in ("libdriveclub_android.so", "libdriveclub_game.so", "libdriveclub_vulkan.so"):
+            require("libvulkan.so" not in results[name]["needed"],
+                    f"{name}: direct system Vulkan dependency bypasses the selected driver")
+            raw_calls = {symbol for symbol in results[name]["strong_imports"] if re.match(r"vk[A-Z]", symbol)}
+            require(not raw_calls,
+                    f"{name}: unwrapped Vulkan imports bypass the selected driver: {', '.join(sorted(raw_calls))}")
+        require("libadrenotools.so" not in results["libdriveclub_vulkan.so"]["needed"],
+                "Vulkan selector must load AdrenoTools only after an explicit custom-driver choice")
+        for name in ("libdriveclub_android.so", "libdriveclub_game.so"):
+            require("libdriveclub_vulkan.so" in results[name]["needed"],
+                    f"{name}: missing shared selected-driver dependency")
+        commands_file = Path(__file__).resolve().parents[1] / "cmake/VulkanCommands.cmake"
+        commands = set(re.findall(r"^\s+(vk[A-Za-z0-9_]+)\s*$", commands_file.read_text(), re.MULTILINE))
+        require(commands, "Vulkan direct-call manifest is empty")
+        wrappers = {"__wrap_" + command for command in commands}
+        missing_wrappers = wrappers - results["libdriveclub_vulkan.so"]["exports"]
+        require(not missing_wrappers,
+                "Selected driver library is missing Vulkan forwarders: " + ", ".join(sorted(missing_wrappers)))
         for name, result in results.items():
             absent = set(result["needed"]) - set(present) - ANDROID_SYSTEM_LIBRARIES
             require(not absent, f"{name}: unsatisfied DT_NEEDED closure: {', '.join(sorted(absent))}")
@@ -192,14 +283,20 @@ def audit(apk: Path) -> dict:
             cpu_imports = {symbol for symbol in result["strong_imports"] if symbol.startswith("guest_cpu_")}
             require(cpu_imports <= results["libbbcpu.so"]["exports"],
                     f"{name}: CPU bridge imports are absent from packaged libbbcpu.so")
+            driver_imports = {symbol for symbol in result["strong_imports"]
+                              if symbol.startswith(("driveclub_vk_", "__wrap_vk"))}
+            require(driver_imports <= results["libdriveclub_vulkan.so"]["exports"],
+                    f"{name}: selected-driver imports are absent from packaged libdriveclub_vulkan.so")
         require("libbbcpu.so" in results["libdriveclub_game.so"]["needed"],
                 "Game JNI library is not linked to the packaged FEX backend")
         require("libaaudio.so" in results["libdriveclub_game.so"]["needed"],
                 "Game JNI library is not linked to the Android AAudio backend")
+        turnip = audit_turnip(archive)
         report = []
         for result in results.values():
             report.append({key: value for key, value in result.items() if key not in ("exports", "strong_imports")})
-    return {"apk": str(apk.resolve()), "libraries": report,
+    return {"apk": str(apk.resolve()), "libraries": report, "bundled_driver": turnip,
+            "selected_driver_forwarders": len(wrappers),
             "runtime_page_size_requirement": 4096,
             "validation": "ELF/link/package audit only; gameplay and Vulkan execution require device tests"}
 
@@ -220,7 +317,10 @@ def main() -> int:
         for library in result["libraries"]:
             print(f"{library['name']}: AArch64/Bionic API {library['android_api']}, "
                   f"ELF alignment {library['load_alignment']}; DT_NEEDED {', '.join(library['needed'])}")
-        print("APK audit passed: packaged ARM64 runtime, CPU/JNI exports and Android dependency closure.")
+        driver = result["bundled_driver"]
+        print(f"Bundled driver: {driver['name']}; ZIP SHA-256 {driver['zip_sha256']}; HAL {driver['hal_entry']}.")
+        print(f"Selected Vulkan loader: {result['selected_driver_forwarders']} direct-call forwarders; no direct system loader dependency.")
+        print("APK audit passed: ARM64 runtime, CPU/JNI exports, selected-driver closure and exact bundled Turnip.")
         print("ELF supports 16 KiB alignment; this renderer still requires a 4 KiB host page size.")
     return 0
 
