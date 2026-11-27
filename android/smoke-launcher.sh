@@ -55,12 +55,16 @@ node 'Logs recentes'
 node 'Fechar' tap
 node 'Exportar logs' tap
 node 'Save' tap
-for attempt in 1 2 3 4 5; do
+# DocumentsUI can create an empty file before delivering the URI to our activity.
+for attempt in $(seq 1 20); do
     exported=$(adb shell find /sdcard/ -name driveclub-diagnostico.txt | tr -d '\r' | head -1)
-    if [ -n "$exported" ]; then break; fi
+    if [ -n "$exported" ] && adb shell cat "$exported" > /tmp/driveclub-export.txt &&
+        grep -Fq '[Sessão]' /tmp/driveclub-export.txt && grep -Fq '[Vulkan]' /tmp/driveclub-export.txt; then
+        echo 'Verified session and Vulkan records in the exported document.'
+        exit 0
+    fi
     sleep 1
 done
-test -n "$exported"
-adb shell cat "$exported" > /tmp/driveclub-export.txt
-grep -F '[Sessão]' /tmp/driveclub-export.txt
-grep -F '[Vulkan]' /tmp/driveclub-export.txt
+adb shell run-as org.driveclub.port cat files/driveclub.log
+adb shell ls -l /sdcard/Download/
+exit 1
