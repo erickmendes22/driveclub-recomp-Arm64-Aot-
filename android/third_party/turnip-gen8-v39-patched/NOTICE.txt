@@ -1,0 +1,42 @@
+Turnip Gen8 V39-patched — bundled upstream binary
+================================================
+
+Publisher: StevenMXZ
+Release: https://github.com/StevenMXZ/Adreno-Tools-Drivers/releases/tag/v39
+Original asset: Turnip_Gen8_V39_Patched.zip (asset 721176461)
+SHA-256: bd457b30f195cf93a334b5302c221b1b5cb59c79c485935decf95d560a38c8a2
+
+The original ZIP is bundled unchanged as driver.zip. Its meta.json names the
+driver "Turnip Gen8 V39-patched". The embedded library reports Mesa
+27.0.0-devel (git-2648b2059f). This is the patched Gen8 release, not the
+unpatched Gen8, R2 or OneUI package from the same release.
+
+Mesa source revision:
+https://gitlab.freedesktop.org/mesa/mesa/-/tree/2648b2059f1a412d64a8700dbbb75bbb4a768b0e
+Mesa license information at that revision is included as Mesa-license.rst.
+Mesa is mostly MIT-licensed; individual files carry their own copyright and
+SPDX notices. Mesa's upstream license texts and source notices are included
+with this bundle. They cover source components, not a claim that every Mesa
+component is linked into this driver.
+
+Publisher build recipes and patch sources at the release tag:
+https://github.com/StevenMXZ/Adreno-Tools-Drivers/tree/b3b32ad30e7d7b4bd897e678af064036eeb9df09
+That repository provides GPL version 3 in its LICENSE; a verbatim copy is
+included as LICENSE-Driver-Recipes-GPL-3.0.txt. Its recipes fetch Mesa main
+unless a commit is provided. The release does not record a complete applied
+patch/build manifest, so this project pins the released binary by hash rather
+than claiming that the current recipes reproduce it byte for byte.
+
+The binary was built with Android NDK r29 and contains C++ runtime code without
+a separate libc++ dependency. LICENSE-LLVM.txt preserves the LLVM/libc++
+license and exceptions. Other Android system libraries remain supplied by
+the device, including libhardware, libsync and libnativewindow.
+
+Compatibility metadata: meta.json says minApi 28; the ELF Android ABI note
+says API 34, and strong C11-thread imports require LIBC_R (API 30). Device
+support must be established by loading the driver and checking its Vulkan
+identity/features. The driver exposes the Android Vulkan HAL HMI entry and
+needs AdrenoTools integration; it is not a standalone libvulkan loader.
+
+Sources and hashes are also recorded in provenance.json. No game support or
+performance guarantee is implied by bundling this driver.

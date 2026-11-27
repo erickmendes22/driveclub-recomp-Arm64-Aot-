@@ -11,7 +11,6 @@ import android.view.MotionEvent;
 import android.view.Surface;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
-import android.view.View;
 import android.view.WindowInsets;
 import android.view.WindowInsetsController;
 import android.view.WindowManager;
@@ -33,8 +32,11 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
     private boolean started, loaded, ending;
     private PortLog log;
     private RuntimeFiles files;
-    private int keyButtons, touchButtons;
+    private RacingControls controls;
+    private RacingControls.State touch = RacingControls.State.neutral();
+    private int keyButtons, hatButtons;
     private float lx, ly, rx, ry, leftTrigger, rightTrigger;
+    private boolean analogLeftTrigger, analogRightTrigger;
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
@@ -52,7 +54,12 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
         surface.getHolder().addCallback(this);
         root.addView(surface, new FrameLayout.LayoutParams(-1, -1));
 
-        LinearLayout top = row();
+        controls = new RacingControls(this);
+        controls.setListener(input -> { touch = input; sendInput(); });
+        root.addView(controls, new FrameLayout.LayoutParams(-1, -1));
+
+        LinearLayout top = new LinearLayout(this);
+        top.setGravity(Gravity.CENTER_VERTICAL);
         Button close = button("Sair", "Voltar à garagem");
         close.setOnClickListener(v -> endRuntime("Encerrado pelo usuário"));
         top.addView(close);
@@ -62,33 +69,6 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
         FrameLayout.LayoutParams topParams = new FrameLayout.LayoutParams(-2, dp(48), Gravity.TOP | Gravity.START);
         topParams.topMargin = dp(8); topParams.leftMargin = dp(12);
         root.addView(top, topParams);
-
-        LinearLayout left = column();
-        LinearLayout arrows = row();
-        touch(arrows, "←", "Direcional esquerdo", 0x80);
-        touch(arrows, "↑", "Direcional para cima", 0x10);
-        touch(arrows, "↓", "Direcional para baixo", 0x40);
-        touch(arrows, "→", "Direcional direito", 0x20);
-        left.addView(arrows);
-        LinearLayout shoulders = row();
-        touch(shoulders, "L1", "L1", 0x400);
-        touch(shoulders, "L2", "Frear", 0x100);
-        touch(shoulders, "≡", "Options", 0x8);
-        left.addView(shoulders);
-        placeControls(root, left, Gravity.START);
-
-        LinearLayout right = column();
-        LinearLayout faces = row();
-        touch(faces, "□", "Quadrado", 0x8000);
-        touch(faces, "△", "Triângulo", 0x1000);
-        touch(faces, "○", "Círculo", 0x2000);
-        touch(faces, "×", "Cruz", 0x4000);
-        right.addView(faces);
-        LinearLayout triggers = row();
-        touch(triggers, "R1", "R1", 0x800);
-        touch(triggers, "R2", "Acelerar", 0x200);
-        right.addView(triggers);
-        placeControls(root, right, Gravity.END);
 
         root.setOnApplyWindowInsetsListener((v, insets) -> {
             android.graphics.Insets cutout = insets.getInsets(WindowInsets.Type.displayCutout());
@@ -109,12 +89,6 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
     }
 
     private int dp(int value) { return Math.round(value * getResources().getDisplayMetrics().density); }
-    private LinearLayout row() {
-        LinearLayout row = new LinearLayout(this); row.setGravity(Gravity.CENTER_VERTICAL); return row;
-    }
-    private LinearLayout column() {
-        LinearLayout column = row(); column.setOrientation(LinearLayout.VERTICAL); return column;
-    }
     private Button button(String label, String description) {
         Button button = new Button(this);
         button.setText(label); button.setTextSize(18); button.setAllCaps(false);
@@ -124,26 +98,6 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
         button.setLayoutParams(new LinearLayout.LayoutParams(dp(52), dp(48)));
         return button;
     }
-    private void placeControls(FrameLayout root, View controls, int side) {
-        FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM | side);
-        params.setMargins(dp(12), 0, dp(12), dp(12)); root.addView(controls, params);
-    }
-    private void touch(LinearLayout row, String label, String description, int mask) {
-        Button button = button(label, description);
-        button.setOnTouchListener((view, event) -> {
-            if (event.getActionMasked() == MotionEvent.ACTION_DOWN) {
-                touchButtons |= mask; view.setPressed(true); sendInput(); return true;
-            }
-            if (event.getActionMasked() == MotionEvent.ACTION_UP || event.getActionMasked() == MotionEvent.ACTION_CANCEL) {
-                touchButtons &= ~mask; view.setPressed(false); sendInput();
-                if (event.getActionMasked() == MotionEvent.ACTION_UP) view.performClick();
-                return true;
-            }
-            return true;
-        });
-        row.addView(button);
-    }
-
     @Override public void surfaceCreated(SurfaceHolder holder) {
         if (!loaded || started || ending) return;
         started = true;
@@ -157,8 +111,10 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
                 Path current = getFilesDir().toPath().resolve("driveclub-runtime.log");
                 if (Files.exists(current)) Files.move(current, getFilesDir().toPath().resolve("driveclub-runtime.previous.log"),
                         StandardCopyOption.REPLACE_EXISTING);
+                String update = getIntent().getStringExtra("update");
                 files = new RuntimeFiles(this, Uri.parse(getIntent().getStringExtra("base")),
-                        Uri.parse(getIntent().getStringExtra("update")));
+                        update == null ? null : Uri.parse(update));
+                DriverManager.configure(this, log);
                 log.write("Runtime", "Entrando no carregador Bionic/FEX; conteúdo aberto diretamente das pastas escolhidas");
                 int result = runNative(prepared.toString(), user.toString(), current.toString(), files, holder.getSurface());
                 runOnUiThread(() -> {
@@ -182,15 +138,20 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
 
     private void sendInput() {
         if (!loaded || ending) return;
-        int buttons = keyButtons | touchButtons;
-        float steering = (touchButtons & 0x80) != 0 ? -1 : (touchButtons & 0x20) != 0 ? 1 : lx;
-        inputNative(buttons, steering, ly, rx, ry,
-                Math.max(leftTrigger, (buttons & 0x100) != 0 ? 1 : 0),
-                Math.max(rightTrigger, (buttons & 0x200) != 0 ? 1 : 0));
+        int buttons = keyButtons | hatButtons | touch.buttons;
+        // Digital trigger keys are a fallback only for pads without trigger axes.
+        // Touch trigger bits must never turn a fractional pedal value into full throttle.
+        float padL2 = Math.max(leftTrigger, !analogLeftTrigger && (keyButtons & 0x100) != 0 ? 1 : 0);
+        float padR2 = Math.max(rightTrigger, !analogRightTrigger && (keyButtons & 0x200) != 0 ? 1 : 0);
+        inputNative(buttons, touch.leftActive ? touch.lx : lx, touch.leftActive ? touch.ly : ly,
+                touch.rightActive ? touch.rx : rx, touch.rightActive ? touch.ry : ry,
+                Math.max(padL2, touch.l2), Math.max(padR2, touch.r2));
     }
     private void clearInput() {
-        keyButtons = touchButtons = 0;
+        keyButtons = hatButtons = 0;
         lx = ly = rx = ry = leftTrigger = rightTrigger = 0;
+        touch = RacingControls.State.neutral();
+        if (controls != null) controls.releaseAll();
         sendInput();
     }
     private static int keyMask(int key) {
@@ -217,6 +178,7 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
     @Override public boolean dispatchKeyEvent(KeyEvent event) {
         int mask = keyMask(event.getKeyCode());
         if (mask != 0 && (event.getAction() == KeyEvent.ACTION_DOWN || event.getAction() == KeyEvent.ACTION_UP)) {
+            updateTriggerCapabilities(event.getDevice());
             if (event.getAction() == KeyEvent.ACTION_DOWN) keyButtons |= mask;
             else keyButtons &= ~mask;
             sendInput(); return true;
@@ -225,18 +187,32 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
     }
     @Override public boolean onGenericMotionEvent(MotionEvent event) {
         if (event.isFromSource(InputDevice.SOURCE_JOYSTICK) && event.getAction() == MotionEvent.ACTION_MOVE) {
-            lx = event.getAxisValue(MotionEvent.AXIS_X); ly = event.getAxisValue(MotionEvent.AXIS_Y);
-            rx = event.getAxisValue(MotionEvent.AXIS_Z); ry = event.getAxisValue(MotionEvent.AXIS_RZ);
+            updateTriggerCapabilities(event.getDevice());
+            lx = stickAxis(event, MotionEvent.AXIS_X); ly = stickAxis(event, MotionEvent.AXIS_Y);
+            rx = stickAxis(event, MotionEvent.AXIS_Z); ry = stickAxis(event, MotionEvent.AXIS_RZ);
             leftTrigger = Math.max(event.getAxisValue(MotionEvent.AXIS_LTRIGGER), event.getAxisValue(MotionEvent.AXIS_BRAKE));
             rightTrigger = Math.max(event.getAxisValue(MotionEvent.AXIS_RTRIGGER), event.getAxisValue(MotionEvent.AXIS_GAS));
-            keyButtons &= ~0xf0;
-            if (event.getAxisValue(MotionEvent.AXIS_HAT_X) < -.5f) keyButtons |= 0x80;
-            if (event.getAxisValue(MotionEvent.AXIS_HAT_X) > .5f) keyButtons |= 0x20;
-            if (event.getAxisValue(MotionEvent.AXIS_HAT_Y) < -.5f) keyButtons |= 0x10;
-            if (event.getAxisValue(MotionEvent.AXIS_HAT_Y) > .5f) keyButtons |= 0x40;
+            hatButtons = 0;
+            if (event.getAxisValue(MotionEvent.AXIS_HAT_X) < -.5f) hatButtons |= 0x80;
+            if (event.getAxisValue(MotionEvent.AXIS_HAT_X) > .5f) hatButtons |= 0x20;
+            if (event.getAxisValue(MotionEvent.AXIS_HAT_Y) < -.5f) hatButtons |= 0x10;
+            if (event.getAxisValue(MotionEvent.AXIS_HAT_Y) > .5f) hatButtons |= 0x40;
             sendInput(); return true;
         }
         return super.onGenericMotionEvent(event);
+    }
+    private void updateTriggerCapabilities(InputDevice device) {
+        if (device == null) return;
+        analogLeftTrigger = device.getMotionRange(MotionEvent.AXIS_LTRIGGER) != null
+                || device.getMotionRange(MotionEvent.AXIS_BRAKE) != null;
+        analogRightTrigger = device.getMotionRange(MotionEvent.AXIS_RTRIGGER) != null
+                || device.getMotionRange(MotionEvent.AXIS_GAS) != null;
+    }
+    private float stickAxis(MotionEvent event, int axis) {
+        InputDevice device = event.getDevice();
+        InputDevice.MotionRange range = device == null ? null : device.getMotionRange(axis, event.getSource());
+        float value = event.getAxisValue(axis), flat = range == null ? .08f : Math.max(.04f, range.getFlat());
+        return Math.abs(value) <= flat ? 0 : Math.max(-1, Math.min(1, value));
     }
     @Override public void onWindowFocusChanged(boolean focused) {
         super.onWindowFocusChanged(focused); if (!focused) clearInput();

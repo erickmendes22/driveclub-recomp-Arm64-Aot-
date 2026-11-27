@@ -4,7 +4,6 @@ import android.content.Context;
 import android.content.SharedPreferences;
 import android.net.Uri;
 import android.os.ParcelFileDescriptor;
-import android.provider.DocumentsContract;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
@@ -13,29 +12,16 @@ import java.nio.file.Path;
 import java.util.Comparator;
 import java.util.stream.Stream;
 
-/** Resolve Android document trees into the private inputs of the shared PC preparer. */
+/** Prepare selected folders or installed packages entirely on this device. */
 final class LocalGame {
     interface Progress { void update(int stage, String message); }
     private static native String prepareNative(String root, Progress progress);
     private static final String[] MODULES = {"sce_module/libc.prx", "sce_module/libSceFios2.prx", "libtbb.prx",
             "libfmod.prx", "libfmodstudio.prx", "iksemelGNMm.prx", "logiWheel.prx", "oskGNMm.prx"};
 
-    private static Uri find(GameLibrary library, Uri tree, String relative) throws IOException {
-        String parent = DocumentsContract.getTreeDocumentId(tree);
-        int slash = relative.indexOf('/');
-        if (slash >= 0) {
-            Uri dir = library.child(tree, parent, relative.substring(0, slash), true);
-            if (dir == null) return null;
-            parent = DocumentsContract.getDocumentId(dir);
-        }
-        return library.child(tree, parent, relative.substring(slash + 1), false);
-    }
-
-    private static void copy(Context context, Uri file, Path dest) throws IOException {
-        if (file == null) throw new IOException("Arquivo ausente: " + dest.getFileName());
+    private static void copy(RuntimeFiles files, String relative, Path dest) throws IOException {
         Files.createDirectories(dest.getParent());
-        try (InputStream in = context.getContentResolver().openInputStream(file)) {
-            if (in == null) throw new IOException("Falha de leitura: " + dest.getFileName());
+        try (InputStream in = files.openInput(relative)) {
             Files.copy(in, dest);
         }
     }
@@ -91,26 +77,27 @@ final class LocalGame {
                 if (path.getFileName().toString().startsWith("local-")
                         && !path.getFileName().toString().equals(active)) remove(path);
         }
-        Uri data = find(library, base, "game000.dat");
-        if (data == null) throw new IOException("game000.dat ausente na pasta base");
         Path next = Files.createTempDirectory(root, "local-");
         boolean published = false;
-        try (ParcelFileDescriptor fd = context.getContentResolver().openFileDescriptor(data, "r")) {
-            if (fd == null) throw new IOException("game000.dat inacessível");
+        try (RuntimeFiles baseFiles = new RuntimeFiles(context, base, base);
+             RuntimeFiles updateFiles = new RuntimeFiles(context, update, update);
+             ParcelFileDescriptor fd = baseFiles.openDescriptor("game000.dat")) {
             log.write("Preparação local", "Lendo executável e módulos no aparelho");
             Path updateDir = next.resolve("update");
             Path baseDir = Files.createDirectories(next.resolve("base"));
             // PrepareGame checks the base archive exists. Keep its real descriptor alive
             // through the call so that even very large archives stay in the selected tree.
             Files.createSymbolicLink(baseDir.resolve("game000.dat"), new File("/proc/self/fd/" + fd.getFd()).toPath());
-            copy(context, find(library, update, "eboot.bin"), updateDir.resolve("eboot.bin"));
-            Uri sfo = find(library, update, "sce_sys/param.sfo");
-            copy(context, sfo != null ? sfo : find(library, update, "param.sfo"), updateDir.resolve("sce_sys/param.sfo"));
+            copy(updateFiles, "eboot.bin", updateDir.resolve("eboot.bin"));
+            copy(updateFiles, updateFiles.hasFile("sce_sys/param.sfo") ? "sce_sys/param.sfo" : "param.sfo",
+                    updateDir.resolve("sce_sys/param.sfo"));
             for (String name : MODULES) {
                 boolean baseFirst = name.startsWith("libfmod");
-                Uri module = find(library, baseFirst ? base : update, name);
-                if (module == null) module = find(library, baseFirst ? update : base, name);
-                if (module != null || !name.equals("oskGNMm.prx")) copy(context, module, updateDir.resolve(name));
+                RuntimeFiles first = baseFirst ? baseFiles : updateFiles;
+                RuntimeFiles second = baseFirst ? updateFiles : baseFiles;
+                RuntimeFiles source = first.hasFile(name) ? first : second.hasFile(name) ? second : null;
+                if (source != null) copy(source, name, updateDir.resolve(name));
+                else if (!name.equals("oskGNMm.prx")) throw new IOException("Arquivo ausente: " + name);
             }
             try (InputStream xml = context.getAssets().open("DriveClub.xml")) {
                 Files.copy(xml, next.resolve("patches.xml"));
@@ -126,7 +113,7 @@ final class LocalGame {
             }
             Files.delete(next.resolve("patches.xml"));
             if (!complete(next)) throw new IOException("A preparação local não gerou todos os arquivos necessários");
-            if (!base.equals(library.folder(GameLibrary.BASE)) || !update.equals(library.folder(GameLibrary.UPDATE))) return null;
+            if (!library.matches(base, update)) return null;
             published = state.edit().putString("active", next.getFileName().toString())
                     .putString("base", base.toString()).putString("update", update.toString())
                     .putString("sourceStamp", stamp).commit();

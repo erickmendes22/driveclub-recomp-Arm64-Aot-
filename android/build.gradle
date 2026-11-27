@@ -8,13 +8,17 @@ android {
     compileSdk 35
     buildToolsVersion '35.0.0'
     ndkVersion '29.0.14206865'
+    useLibrary 'android.test.runner', false
+    useLibrary 'android.test.base', false
+    packaging { jniLibs { useLegacyPackaging true } }
 
     defaultConfig {
         applicationId 'org.driveclub.port'
         minSdk 30
         targetSdk 35
-        versionCode 4
-        versionName '0.4'
+        versionCode 5
+        versionName '0.5'
+        testInstrumentationRunner 'android.test.InstrumentationTestRunner'
         buildConfigField 'boolean', 'GAME_RUNTIME', (providers.gradleProperty('launcherTestAbi').getOrElse('arm64-v8a') == 'arm64-v8a').toString()
         externalNativeBuild { cmake { arguments '-DANDROID_STL=c++_shared', '-DCMAKE_BUILD_TYPE=Release' } }
         ndk { abiFilters providers.gradleProperty('launcherTestAbi').getOrElse('arm64-v8a') }
@@ -38,3 +42,5 @@ android.sourceSets.main.res.srcDir(layout.buildDirectory.dir('generated/launcher
 tasks.named('preBuild').configure { dependsOn artwork }
 
 android.sourceSets.main.assets.srcDir('../patches')
+android.sourceSets.main.assets.srcDir('../out/android-driver/assets')
+android.sourceSets.androidTest.assets.srcDir('../out/pkg-fixtures')

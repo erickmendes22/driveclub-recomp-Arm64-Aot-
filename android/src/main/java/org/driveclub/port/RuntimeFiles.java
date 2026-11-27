@@ -10,12 +10,19 @@ import android.system.ErrnoException;
 import android.system.Os;
 import android.system.OsConstants;
 import java.io.Closeable;
+import java.io.File;
+import java.io.FileNotFoundException;
 import java.io.IOException;
+import java.io.InputStream;
+import java.nio.file.Files;
+import java.nio.file.LinkOption;
+import java.nio.file.Path;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.TreeMap;
 
-/** Read-only /app0 overlay backed by the user's persisted document grants. */
+/** Read-only /app0 overlay backed by document grants or locally installed PKGs. */
 final class RuntimeFiles implements Closeable {
     private final Context context;
     private final Uri base, update;
@@ -35,7 +42,7 @@ final class RuntimeFiles implements Closeable {
 
     RuntimeFiles(Context context, Uri base, Uri update) {
         this.context = context.getApplicationContext();
-        this.base = base; this.update = update;
+        this.base = base; this.update = update == null ? base : update;
     }
 
     private static String checked(String path) throws IOException {
@@ -54,6 +61,19 @@ final class RuntimeFiles implements Closeable {
         Map<String, Node> cached = directories.get(key);
         if (cached != null) return cached;
         Map<String, Node> result = new LinkedHashMap<>();
+        if ("file".equals(parent.tree.getScheme())) {
+            Path directory = new File(parent.uri.getPath()).toPath();
+            try (java.nio.file.DirectoryStream<Path> entries = Files.newDirectoryStream(directory)) {
+                for (Path path : entries) {
+                    BasicFileAttributes attrs = Files.readAttributes(path, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+                    if (!attrs.isDirectory() && !attrs.isRegularFile()) continue;
+                    result.put(path.getFileName().toString(), new Node(parent.tree, Uri.fromFile(path.toFile()),
+                            path.toString(), attrs.isDirectory(), attrs.size(), attrs.lastModifiedTime().toMillis()));
+                }
+            }
+            directories.put(key, result);
+            return result;
+        }
         String[] columns = {Document.COLUMN_DOCUMENT_ID, Document.COLUMN_DISPLAY_NAME,
                 Document.COLUMN_MIME_TYPE, Document.COLUMN_SIZE, Document.COLUMN_LAST_MODIFIED};
         Uri uri = DocumentsContract.buildChildDocumentsUriUsingTree(parent.tree, parent.id);
@@ -73,8 +93,19 @@ final class RuntimeFiles implements Closeable {
     }
 
     private Node find(Uri tree, String path) throws IOException {
-        String id = DocumentsContract.getTreeDocumentId(tree);
-        Node node = new Node(tree, DocumentsContract.buildDocumentUriUsingTree(tree, id), id, true, 0, 0);
+        if (tree == null) return null;
+        Node node;
+        if ("file".equals(tree.getScheme())) {
+            Path root = checkedInstalledRoot(context, tree);
+            BasicFileAttributes attrs = Files.readAttributes(root, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+            if (!attrs.isDirectory()) throw new IOException("A instalação local não é uma pasta");
+            node = new Node(tree, Uri.fromFile(root.toFile()), root.toString(), true, 0, attrs.lastModifiedTime().toMillis());
+        } else {
+            if (!"content".equals(tree.getScheme()) || !DocumentsContract.isTreeUri(tree))
+                throw new IOException("Selecione uma pasta pelo seletor do Android");
+            String id = DocumentsContract.getTreeDocumentId(tree);
+            node = new Node(tree, DocumentsContract.buildDocumentUriUsingTree(tree, id), id, true, 0, 0);
+        }
         if (path.isEmpty()) return node;
         for (String part : path.split("/")) {
             Map<String, Node> entries = children(node);
@@ -91,13 +122,28 @@ final class RuntimeFiles implements Closeable {
         return node;
     }
 
+    static Path checkedInstalledRoot(Context context, Uri uri) throws IOException {
+        if (uri == null || !"file".equals(uri.getScheme()) || uri.getPath() == null)
+            throw new IOException("Instalação local inválida");
+        Path installed = context.getNoBackupFilesDir().toPath().resolve("driveclub/installed").toAbsolutePath().normalize();
+        Path root = new File(uri.getPath()).toPath().toAbsolutePath().normalize();
+        if (root.equals(installed) || !root.startsWith(installed) || Files.isSymbolicLink(root))
+            throw new IOException("A pasta não pertence a uma instalação deste aplicativo");
+        Path actual = root.toRealPath(), boundary = installed.toRealPath();
+        if (actual.equals(boundary) || !actual.startsWith(boundary))
+            throw new IOException("A instalação local aponta para fora da pasta do aplicativo");
+        return actual;
+    }
+
     private Node merged(String path) throws IOException {
         Node node = find(update, path);
         return node != null ? node : find(base, path);
     }
 
     private ParcelFileDescriptor open(Node node) throws IOException {
-        ParcelFileDescriptor fd = context.getContentResolver().openFileDescriptor(node.uri, "r");
+        ParcelFileDescriptor fd = "file".equals(node.tree.getScheme())
+                ? ParcelFileDescriptor.open(new File(node.uri.getPath()), ParcelFileDescriptor.MODE_READ_ONLY)
+                : context.getContentResolver().openFileDescriptor(node.uri, "r");
         if (fd == null) throw new IOException("Não foi possível abrir o arquivo selecionado");
         try {
             Os.lseek(fd.getFileDescriptor(), 0, OsConstants.SEEK_CUR);
@@ -106,6 +152,21 @@ final class RuntimeFiles implements Closeable {
             fd.close();
             throw new IOException("O provedor precisa permitir acesso direto aos arquivos. Use uma pasta local do aparelho.", e);
         }
+    }
+
+    synchronized ParcelFileDescriptor openDescriptor(String relativePath) throws IOException {
+        Node node = merged(checked(relativePath));
+        if (node == null || node.directory) throw new FileNotFoundException("Arquivo ausente: " + relativePath);
+        return open(node);
+    }
+
+    synchronized boolean hasFile(String relativePath) throws IOException {
+        Node node = merged(checked(relativePath));
+        return node != null && !node.directory;
+    }
+
+    synchronized InputStream openInput(String relativePath) throws IOException {
+        return new ParcelFileDescriptor.AutoCloseInputStream(openDescriptor(relativePath));
     }
 
     // Called by JNI from guest file threads. Native code owns each detached descriptor.

@@ -3,15 +3,17 @@ package org.driveclub.port;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
-import android.database.Cursor;
 import android.net.Uri;
-import android.provider.DocumentsContract;
-import android.provider.DocumentsContract.Document;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.Comparator;
+import java.util.Objects;
+import java.util.stream.Stream;
 
-/** Driveclub's base/update folder flow using persisted, read-only document grants. */
+/** A game folder can already include its update; a separate update is an optional overlay. */
 final class GameLibrary {
     static final String BASE = "base", UPDATE = "update";
     private final Context context;
@@ -27,58 +29,112 @@ final class GameLibrary {
         return value == null ? null : Uri.parse(value);
     }
 
-    void select(String key, Uri tree) {
+    Uri effectiveUpdate() {
+        Uri update = folder(UPDATE);
+        return update == null ? folder(BASE) : update;
+    }
+
+    boolean matches(Uri base, Uri update) {
+        return Objects.equals(base, folder(BASE)) && Objects.equals(update, effectiveUpdate());
+    }
+
+    void select(String key, Uri tree) throws IOException {
+        if (!"content".equals(tree.getScheme()) || !android.provider.DocumentsContract.isTreeUri(tree))
+            throw new IOException("Selecione uma pasta pelo seletor do Android");
         context.getContentResolver().takePersistableUriPermission(tree, Intent.FLAG_GRANT_READ_URI_PERMISSION);
-        Uri old = folder(key);
-        prefs.edit().putString(key, tree.toString()).apply();
-        String other = BASE.equals(key) ? UPDATE : BASE;
-        if (old != null && !old.equals(tree) && !old.equals(folder(other))) {
-            try {
-                context.getContentResolver().releasePersistableUriPermission(old, Intent.FLAG_GRANT_READ_URI_PERMISSION);
-            } catch (SecurityException ignored) { /* A provider can revoke a grant itself. */ }
+        Uri oldBase = folder(BASE), oldUpdate = folder(UPDATE);
+        SharedPreferences.Editor change = prefs.edit().putString(key, tree.toString());
+        // A newly selected game is self-contained unless the user adds an overlay afterwards.
+        if (BASE.equals(key)) change.remove(UPDATE);
+        if (!change.commit()) throw new IOException("Não foi possível salvar a pasta selecionada");
+        releaseUnusedGrant(oldBase);
+        releaseUnusedGrant(oldUpdate);
+    }
+
+    void clearUpdate() throws IOException {
+        Uri old = folder(UPDATE);
+        if (!prefs.edit().remove(UPDATE).commit()) throw new IOException("Falha ao alterar a atualização");
+        releaseUnusedGrant(old);
+    }
+
+    private void releaseUnusedGrant(Uri old) {
+        if (old == null || !"content".equals(old.getScheme()) || old.equals(folder(BASE)) || old.equals(folder(UPDATE))) return;
+        try {
+            context.getContentResolver().releasePersistableUriPermission(old, Intent.FLAG_GRANT_READ_URI_PERMISSION);
+        } catch (SecurityException ignored) { /* The provider may already have revoked it. */ }
+    }
+
+    /** Publish only a complete extraction. No current files or save data are modified in place. */
+    void publish(PkgInstaller.Result result, PortLog log) throws IOException {
+        if (!"CUSA00093".equals(result.titleId)) throw new IOException("Este PKG não pertence ao Driveclub CUSA00093");
+        Uri uri = Uri.fromFile(result.root.toFile());
+        RuntimeFiles.checkedInstalledRoot(context, uri);
+        Uri oldBase = folder(BASE), oldUpdate = folder(UPDATE);
+        if (result.isUpdate && oldBase == null)
+            throw new IOException("Instale o jogo base ou selecione sua pasta antes de instalar a atualização");
+        SharedPreferences.Editor change = prefs.edit();
+        if (result.isUpdate) change.putString(UPDATE, uri.toString());
+        else change.putString(BASE, uri.toString()).remove(UPDATE);
+        if (!change.commit()) throw new IOException("Não foi possível ativar o PKG instalado");
+        releaseUnusedGrant(oldBase);
+        releaseUnusedGrant(oldUpdate);
+        removeUnusedInstallation(oldBase, log);
+        removeUnusedInstallation(oldUpdate, log);
+    }
+
+    private void removeUnusedInstallation(Uri previous, PortLog log) {
+        if (previous == null || !"file".equals(previous.getScheme())
+                || previous.equals(folder(BASE)) || previous.equals(folder(UPDATE))) return;
+        try {
+            Path root = RuntimeFiles.checkedInstalledRoot(context, previous);
+            try (Stream<Path> files = Files.walk(root)) {
+                for (Path path : (Iterable<Path>) files.sorted(Comparator.reverseOrder())::iterator) Files.delete(path);
+            }
+        } catch (IOException e) {
+            log.write("PKG", "Instalação ativada; não foi possível limpar a anterior: " + e.getMessage());
         }
     }
 
-    Uri child(Uri tree, String parent, String name, boolean directory) throws IOException {
-        Uri children = DocumentsContract.buildChildDocumentsUriUsingTree(tree, parent);
-        String[] columns = {Document.COLUMN_DOCUMENT_ID, Document.COLUMN_DISPLAY_NAME, Document.COLUMN_MIME_TYPE};
-        try (Cursor rows = context.getContentResolver().query(children, columns, null, null, null)) {
-            if (rows == null) throw new IOException();
-            while (rows.moveToNext()) {
-                if (name.equals(rows.getString(1)) && directory == Document.MIME_TYPE_DIR.equals(rows.getString(2))) {
-                    return DocumentsContract.buildDocumentUriUsingTree(tree, rows.getString(0));
-                }
-            }
-        }
-        return null;
+    void discard(PkgInstaller.Result result, PortLog log) {
+        if (result != null) removeUnusedInstallation(Uri.fromFile(result.root.toFile()), log);
     }
 
     String summary(String key) throws IOException {
         Uri tree = folder(key);
-        if (tree == null) return BASE.equals(key) ? "Selecione a pasta que contém game000.dat." :
-                "Selecione a pasta que contém sce_sys.";
-        String root = DocumentsContract.getTreeDocumentId(tree);
-        if (BASE.equals(key)) return child(tree, root, "game000.dat", false) == null ?
-                "game000.dat ausente na pasta selecionada." : "game000.dat encontrado.";
-        Uri sys = child(tree, root, "sce_sys", true);
-        Uri sfo = sys == null ? null : child(tree, DocumentsContract.getDocumentId(sys), "param.sfo", false);
-        if (sfo == null) sfo = child(tree, root, "param.sfo", false);
-        if (sfo == null) return "param.sfo ausente na pasta selecionada.";
-        return inspectFile(sfo);
+        if (tree == null) return BASE.equals(key)
+                ? "Escolha a pasta com game000.dat. Ela pode já conter a atualização 1.28."
+                : "Opcional: use apenas se a atualização estiver em outra pasta.";
+        try (RuntimeFiles source = new RuntimeFiles(context, tree, tree)) {
+            String prefix = "file".equals(tree.getScheme()) ? "Instalado por PKG.\n" : "";
+            if (BASE.equals(key) && !source.hasFile("game000.dat"))
+                return prefix + "game000.dat ausente na pasta selecionada.";
+            String sfo = source.hasFile("sce_sys/param.sfo") ? "sce_sys/param.sfo"
+                    : source.hasFile("param.sfo") ? "param.sfo" : null;
+            if (sfo == null) return prefix + (BASE.equals(key)
+                    ? "game000.dat encontrado. Adicione a atualização 1.28 se ela estiver em outra pasta."
+                    : "param.sfo ausente na atualização selecionada.");
+            try (InputStream input = source.openInput(sfo)) {
+                return prefix + (BASE.equals(key) ? "game000.dat encontrado.\n" : "") + inspectStream(input);
+            }
+        }
     }
 
     String inspectFile(Uri uri) throws IOException {
-        if (!PortActivity.nativeAvailable()) return "Biblioteca nativa indisponível. Consulte os logs.";
         try (InputStream input = context.getContentResolver().openInputStream(uri)) {
-            if (input == null) throw new IOException();
-            ByteArrayOutputStream bytes = new ByteArrayOutputStream();
-            byte[] block = new byte[4096];
-            int count;
-            while ((count = input.read(block)) != -1) {
-                if (bytes.size() + count > 65536) throw new IOException();
-                bytes.write(block, 0, count);
-            }
-            return PortActivity.inspect(bytes.toByteArray());
+            if (input == null) throw new IOException("Arquivo inacessível");
+            return inspectStream(input);
         }
+    }
+
+    private String inspectStream(InputStream input) throws IOException {
+        if (!PortActivity.nativeAvailable()) return "Biblioteca nativa indisponível. Consulte os logs.";
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        byte[] block = new byte[4096];
+        int count;
+        while ((count = input.read(block)) != -1) {
+            if (bytes.size() + count > 65536) throw new IOException("param.sfo excede o limite de 64 KiB");
+            bytes.write(block, 0, count);
+        }
+        return PortActivity.inspect(bytes.toByteArray());
     }
 }
