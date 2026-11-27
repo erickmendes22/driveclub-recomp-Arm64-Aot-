@@ -15,6 +15,13 @@ if ! git -C "$source_dir" cat-file -e "$revision^{commit}" 2>/dev/null; then
 fi
 git -C "$source_dir" checkout -q --detach "$revision"
 git -C "$source_dir" submodule update --init --recursive --depth 1
+patch_file=$PWD/cpu/fex-host-pages.patch
+if git -C "$source_dir" apply --check "$patch_file" 2>/dev/null; then
+    git -C "$source_dir" apply "$patch_file"
+elif ! git -C "$source_dir" apply --reverse --check "$patch_file" 2>/dev/null; then
+    echo 'FEX host-page patch does not match the pinned source' >&2
+    exit 1
+fi
 cmake -S "$source_dir" -B "$build_dir" -G Ninja \
     -DCMAKE_TOOLCHAIN_FILE="$ndk/build/cmake/android.toolchain.cmake" \
     -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-30 -DANDROID_STL=c++_shared \

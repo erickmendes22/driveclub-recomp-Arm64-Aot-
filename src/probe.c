@@ -12,6 +12,9 @@
 #include "../gpu/shim/bbport_diagnostics.h"
 #include "guest_cpu.h"
 #include "gpu/bbgpu.h"
+#if defined(__ANDROID__) && defined(DRIVECLUB_ANDROID_RUNTIME)
+#include "runtime_android.h"
+#endif
 #if !defined(__GNUC__) || (!defined(__x86_64__) && defined(_WIN32))
 #error This prototype requires GCC or Clang, on x86-64 for MinGW.
 #endif
@@ -78,7 +81,7 @@ static int entered_game;
 static int gpu_enabled;
 int vulkan_smoke(void);
 
-static void fail(const char *message) { fprintf(stderr, "ERROR: %s\n", message); exit(1); }
+static _Noreturn void fail(const char *message) { fprintf(stderr, "ERROR: %s\n", message); exit(1); }
 static uint64_t read64(FILE *f) {
     unsigned char b[8];
     if (fread(b, 1, 8, f) != 8) fail("truncated boot file");
@@ -615,6 +618,9 @@ static uint64_t patch_tcb_loads(const Segment *segments, uint64_t count) {
 }
 #endif
 #ifndef _WIN32
+#ifdef __ANDROID__
+static struct sigaction android_signal_previous[NSIG];
+#endif
 static void fault(int sig, siginfo_t *info, void *context) {
     /* The guest CPU's own faults (FEXCore's JIT), then GPU page tracking (write-protected guest pages). */
     if (guest_cpu_handle_fault(sig, info, context)) return;
@@ -632,6 +638,24 @@ static void fault(int sig, siginfo_t *info, void *context) {
     /* The process is terminating: dladdr/snprintf are acceptable here. */
     GuestRegs regs;
     const int in_guest = guest_cpu_signal_regs(context, &regs);
+#ifdef __ANDROID__
+    /* ART uses SIGSEGV for managed implicit null checks. A separate Android
+     * process still has VM/UI threads, so preserve its signal chain for faults
+     * outside translated guest execution and guest->HLE calls. */
+    int managed=!in_guest;
+#ifdef DRIVECLUB_ANDROID_RUNTIME
+    managed=managed || driveclub_android_in_java();
+#endif
+    if (managed && sig>0 && sig<NSIG) {
+        const struct sigaction *previous=&android_signal_previous[sig];
+        if (previous->sa_handler==SIG_IGN) return;
+        if (previous->sa_handler!=SIG_DFL && previous->sa_handler!=NULL) {
+            if (previous->sa_flags&SA_SIGINFO) previous->sa_sigaction(sig,info,context);
+            else previous->sa_handler(sig);
+            return;
+        }
+    }
+#endif
     uintptr_t rip = in_guest == GUEST_CPU_IN_GUEST ? (uintptr_t)regs.rip : guest_cpu_host_pc(context);
     char line[512];
     Dl_info where;
@@ -1404,6 +1428,11 @@ static void print_system_info(void) {
     }
 }
 #endif
+#if defined(__ANDROID__) && defined(DRIVECLUB_ANDROID_RUNTIME)
+/* The loader owns exit(), signal handlers and process globals. Its Android
+ * caller runs this entry only in the dedicated :runtime process. */
+#define main driveclub_runtime_main
+#endif
 int main(int argc, char **argv) {
 #ifdef _WIN32
     start_tick=GetTickCount64();
@@ -1504,7 +1533,14 @@ int main(int argc, char **argv) {
     page_size = (size_t)sysconf(_SC_PAGESIZE);
     struct sigaction sa = {0}; sa.sa_sigaction = fault; sa.sa_flags = SA_SIGINFO;
     sigemptyset(&sa.sa_mask);
+#ifdef __ANDROID__
+    sa.sa_flags|=SA_ONSTACK;
+    sigaction(SIGSEGV, &sa, &android_signal_previous[SIGSEGV]);
+    sigaction(SIGILL, &sa, &android_signal_previous[SIGILL]);
+    sigaction(SIGBUS, &sa, &android_signal_previous[SIGBUS]);
+#else
     sigaction(SIGSEGV, &sa, NULL); sigaction(SIGILL, &sa, NULL); sigaction(SIGBUS, &sa, NULL);
+#endif
     Dl_info self_info;
     if (dladdr((void *)main,&self_info)) exe_base=(uintptr_t)self_info.dli_fbase;
     struct sigaction dump = {0}; dump.sa_sigaction = thread_dump; dump.sa_flags = SA_SIGINFO|SA_RESTART;
@@ -1624,7 +1660,7 @@ int main(int argc, char **argv) {
     if (fread(image, 1, size, f) != size || fgetc(f) != EOF) fail("incorrect memory image size");
     fclose(f);
     if (!cpu_only) {
-        char title[128]="Bloodborne", serial[16]="UNKNOWN", sfo[4096];
+        char title[128]="Driveclub", serial[16]="UNKNOWN", sfo[4096];
         uint32_t attributes=0;
         snprintf(sfo,sizeof(sfo),"%s/sce_sys/param.sfo",app0 ? app0 : ".");
         sfo_value(sfo,"TITLE",title,sizeof(title),NULL);

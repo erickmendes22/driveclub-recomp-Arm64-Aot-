@@ -6,6 +6,13 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
+#ifdef __ANDROID__
+struct ANativeWindow;
+/* Called before bbgpu_init. Takes its own reference to the borrowed Activity
+ * surface. Clear only when ending the isolated runtime process/session. */
+void bbgpu_android_set_window(struct ANativeWindow* window);
+void bbgpu_android_set_refresh_rate(float hz);
+#endif
 typedef struct {
     const char *title;          /* window title */
     const char *serial;         /* CUSA id, names the pipeline cache */

@@ -439,6 +439,9 @@ void AvPlayerState::EmitEvent(AvPlayerEvents event_id, void* event_data) {
     const auto callback = m_init_data.event_replacement.event_callback;
     if (callback) {
         const auto ptr = m_init_data.event_replacement.object_ptr;
+        // The constructor replaces this with our host AutoPlay/Default callback.
+        // DefaultEventCallback crosses FEX for the original guest callback kept
+        // in m_event_replacement; this host dispatch must remain a direct call.
         callback(ptr, event_id, 0, event_data);
     }
 }

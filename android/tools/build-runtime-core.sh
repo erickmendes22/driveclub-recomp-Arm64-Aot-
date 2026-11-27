@@ -6,7 +6,7 @@ tools=${ANDROID_NDK_HOME:?Set ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x
 out=out/android-runtime
 mkdir -p "$out"
 for source in src/probe.c src/runtime*.c src/vulkan_smoke.c third_party/LibAtrac9/C/src/*.c; do
-    "$tools/aarch64-linux-android30-clang" -std=c11 -O2 -fPIC -ffunction-sections -fdata-sections \
+    "$tools/aarch64-linux-android30-clang" -std=c11 -O2 -fPIC -ffunction-sections -fdata-sections -DDRIVECLUB_ANDROID_RUNTIME=1 \
         -I. -Isrc -Ithird_party/SDL3-mingw/x86_64-w64-mingw32/include \
         -c "$source" -o "$out/$(basename "${source%.c}").o"
 done

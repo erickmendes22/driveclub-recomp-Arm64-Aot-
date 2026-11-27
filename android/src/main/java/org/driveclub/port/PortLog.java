@@ -12,22 +12,31 @@ import java.time.Instant;
 import java.util.List;
 
 final class PortLog {
-    private final File current, previous;
+    private final File current, previous, runtime, previousRuntime;
     private static final int LIMIT = 128 * 1024;
 
     PortLog(Context context) {
         current = new File(context.getFilesDir(), "driveclub.log");
         previous = new File(context.getFilesDir(), "driveclub.previous.log");
+        runtime = new File(context.getFilesDir(), "driveclub-runtime.log");
+        previousRuntime = new File(context.getFilesDir(), "driveclub-runtime.previous.log");
     }
 
     void session(Context context) {
         write("Sessão", "Driveclub " + BuildConfig.VERSION_NAME + " · Android " + Build.VERSION.RELEASE
                 + " · " + Build.MANUFACTURER + " " + Build.MODEL + " · " + Build.SUPPORTED_ABIS[0]);
+        recordExits(context);
+    }
+
+    void recordExits(Context context) {
         try {
             ActivityManager manager = context.getSystemService(ActivityManager.class);
-            List<ApplicationExitInfo> exits = manager.getHistoricalProcessExitReasons(null, 0, 1);
-            if (!exits.isEmpty()) {
-                ApplicationExitInfo exit = exits.get(0);
+            List<ApplicationExitInfo> exits = manager.getHistoricalProcessExitReasons(null, 0, 8);
+            android.content.SharedPreferences state = context.getSharedPreferences("diagnostic-exits", Context.MODE_PRIVATE);
+            long last = state.getLong("recorded", 0), newest = last;
+            for (int i = exits.size() - 1; i >= 0; --i) {
+                ApplicationExitInfo exit = exits.get(i);
+                if (exit.getTimestamp() <= last) continue;
                 String reason;
                 switch (exit.getReason()) {
                     case ApplicationExitInfo.REASON_CRASH: reason = "falha Java"; break;
@@ -37,8 +46,11 @@ final class PortLog {
                     default: reason = "motivo Android " + exit.getReason();
                 }
                 write("Saída anterior", Instant.ofEpochMilli(exit.getTimestamp()) + " · " + reason
-                        + " · status " + exit.getStatus());
+                        + " · " + exit.getProcessName() + " · status " + exit.getStatus()
+                        + " · RSS " + exit.getRss() + " KiB · " + exit.getDescription());
+                newest = Math.max(newest, exit.getTimestamp());
             }
+            if (newest > last) state.edit().putLong("recorded", newest).apply();
         } catch (RuntimeException e) {
             write("Histórico Android", e.getClass().getSimpleName());
         }
@@ -64,8 +76,28 @@ final class PortLog {
         synchronized (PortLog.class) {
             ByteArrayOutputStream result = new ByteArrayOutputStream();
             if (previous.isFile()) Files.copy(previous.toPath(), result);
-            Files.copy(current.toPath(), result);
+            if (current.isFile()) Files.copy(current.toPath(), result);
+            appendRuntime(result, previousRuntime, "Execução nativa anterior");
+            appendRuntime(result, runtime, "Execução nativa atual");
             return result.toByteArray();
+        }
+    }
+
+    private static void appendRuntime(ByteArrayOutputStream output, File file, String title) throws IOException {
+        if (!file.isFile()) return;
+        output.write(("\n=== " + title + " ===\n").getBytes(StandardCharsets.UTF_8));
+        try (RandomAccessFile input = new RandomAccessFile(file, "r")) {
+            // A broken guest can log indefinitely. Keep export usable after such a
+            // failure while preserving the final native crash and guest backtrace.
+            long start = Math.max(0, input.length() - 8L * 1024 * 1024);
+            if (start > 0) {
+                output.write("[Exibindo os últimos 8 MiB desta execução]\n".getBytes(StandardCharsets.UTF_8));
+                input.seek(start);
+                input.readLine();
+            }
+            byte[] buffer = new byte[16384];
+            int count;
+            while ((count = input.read(buffer)) != -1) output.write(buffer, 0, count);
         }
     }
 }

@@ -24,6 +24,7 @@
 
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
@@ -69,6 +70,9 @@ FEXCore::Context::Context* ctx;
 void* (*low_map)(size_t, int);
 bool wide_xmm;
 unsigned tsc_shift;
+size_t host_page_size;
+size_t callret_stack_bytes;
+size_t callret_alloc_bytes;
 FEXCore::ArchHelpers::Arm64::UnalignedHandlerType unaligned_type;
 
 // Stubs: 16 bytes each in one region; the first holds CALLBACKRET (0f 3e), the end of guest code
@@ -94,7 +98,6 @@ std::atomic<size_t> hook_count;
 std::shared_mutex code_lock;
 std::vector<std::pair<uintptr_t, size_t>> code_ranges;
 
-constexpr size_t CallRetAlloc = InternalThreadState::CALLRET_STACK_SIZE + 2 * FEXCore::Utils::FEX_PAGE_SIZE;
 constexpr size_t DefaultStack = 1024 * 1024;
 // Above the stack top for calls not nested in guest code: host calls read a few stack argument
 // slots beyond the caller's frame.
@@ -140,13 +143,15 @@ GuestThread* Current() {
     auto* t = new GuestThread {};
     t->thread = ctx->CreateThread(nullptr);
     auto* frame = t->thread->CurrentFrame;
-    void* alloc = mmap(nullptr, CallRetAlloc, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    void* alloc = mmap(nullptr, callret_alloc_bytes, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     if (alloc == MAP_FAILED) {
         Fatal("cannot allocate the call-return stack");
     }
     t->callret_alloc = reinterpret_cast<uintptr_t>(alloc);
-    t->thread->CallRetStackBase = static_cast<char*>(alloc) + FEXCore::Utils::FEX_PAGE_SIZE;
-    mprotect(t->thread->CallRetStackBase, InternalThreadState::CALLRET_STACK_SIZE, PROT_READ | PROT_WRITE);
+    t->thread->CallRetStackBase = static_cast<char*>(alloc) + host_page_size;
+    if (mprotect(t->thread->CallRetStackBase, callret_stack_bytes, PROT_READ | PROT_WRITE) != 0) {
+        Fatal("cannot protect the call-return stack", host_page_size, errno);
+    }
     auto& s = frame->State;
     s.callret_sp = DefaultCallRet(t);
     // A flat 64-bit code segment, as the Linux kernel sets up.
@@ -303,10 +308,19 @@ uint64_t ReadGuest(uintptr_t address) {
 extern "C" {
 void guest_cpu_init(void* (*map)(size_t size, int prot)) {
     low_map = map;
+    const long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0 || (page_size & (page_size - 1))) {
+        Fatal("invalid host page size", page_size);
+    }
+    host_page_size = static_cast<size_t>(page_size);
+    // FEX's guest page size is 4 KiB. Host mappings and mprotect must instead
+    // follow the device's actual page size, including 16 KiB Android kernels.
+    callret_stack_bytes = (InternalThreadState::CALLRET_STACK_SIZE + host_page_size - 1) & ~(host_page_size - 1);
+    callret_alloc_bytes = callret_stack_bytes + 2 * host_page_size;
     // FEXCore's allocator maps its first arena on first use: before the free address space
     // above 47 bits is listed and claimed, so that the arena does not land in a listed gap.
     FEXCore::Allocator::free(FEXCore::Allocator::malloc(64));
-    FEXCore::Allocator::Setup48BitAllocatorIfExists(sysconf(_SC_PAGESIZE));
+    FEXCore::Allocator::Setup48BitAllocatorIfExists(host_page_size);
     // FEXCore's allocator must outlive the static destructors that would free it.
     std::atexit(FEXCore::Allocator::ClearHooks);
     LogMan::Throw::InstallHandler(LogAssert);
@@ -342,7 +356,7 @@ void guest_cpu_init(void* (*map)(size_t size, int prot)) {
     callback_ret = reinterpret_cast<uintptr_t>(stubs);
     stub_count = 1;
     guest_cpu_code(reinterpret_cast<uintptr_t>(stubs), StubBytes);
-    std::printf("Guest CPU: FEXCore JIT (x86-64 guest on this host), TSC x%u\n", 1u << tsc_shift);
+    std::printf("Guest CPU: FEXCore JIT (x86-64 guest on this host), TSC x%u, host page %zu bytes\n", 1u << tsc_shift, host_page_size);
 }
 
 void guest_cpu_code(uintptr_t base, size_t size) {
@@ -419,8 +433,8 @@ uint64_t guest_cpu_call_xmm(uintptr_t fn, unsigned count, const uint64_t* args, 
     for (unsigned i = 0; i < xmm_args; ++i) {
         std::memcpy(saved_xmm[i], Xmm(s, i), xmm_bytes);
         uint64_t* reg = Xmm(s, i);
+        std::memset(reg, 0, xmm_bytes);
         reg[0] = xmm[i];
-        reg[1] = 0;
     }
     s.gregs[REG_RAX] = xmm_args;
     ++t->depth;
@@ -463,7 +477,7 @@ void guest_cpu_thread_end(void) {
     }
     self = nullptr;
     ctx->DestroyThread(t->thread);
-    munmap(reinterpret_cast<void*>(t->callret_alloc), CallRetAlloc);
+    munmap(reinterpret_cast<void*>(t->callret_alloc), callret_alloc_bytes);
     delete t;
 }
 
@@ -520,12 +534,13 @@ int guest_cpu_handle_fault(int sig, siginfo_t* info, void* ucontext) {
     InternalThreadState* thread = t->thread;
     if (sig == SIGSEGV) {
         // Call-return stack overflow or underflow: the stack is only a prediction, start it again.
-        if (address - t->callret_alloc < CallRetAlloc) {
+        const uintptr_t upper_guard = t->callret_alloc + host_page_size + callret_stack_bytes;
+        if (address - t->callret_alloc < host_page_size || address - upper_guard < host_page_size) {
             m.regs[25] = DefaultCallRet(t);
             return 1;
         }
         // The JIT's code buffer filled up while compiling: FEXCore restarts the compilation.
-        if (thread->JITGuardPage && address - thread->JITGuardPage < FEXCore::Utils::FEX_PAGE_SIZE) {
+        if (thread->JITGuardPage && address - thread->JITGuardPage < host_page_size) {
             FpsimdRecord* fp = Fpsimd(uc);
             if (!fp) {
                 return 0;

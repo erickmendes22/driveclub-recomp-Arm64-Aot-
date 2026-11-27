@@ -68,6 +68,7 @@ final class GameLibrary {
     }
 
     String inspectFile(Uri uri) throws IOException {
+        if (!PortActivity.nativeAvailable()) return "Biblioteca nativa indisponível. Consulte os logs.";
         try (InputStream input = context.getContentResolver().openInputStream(uri)) {
             if (input == null) throw new IOException();
             ByteArrayOutputStream bytes = new ByteArrayOutputStream();

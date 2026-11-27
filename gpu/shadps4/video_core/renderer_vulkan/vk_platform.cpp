@@ -2,8 +2,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 // Include the vulkan platform specific header
-#if defined(ANDROID)
+#if defined(__ANDROID__) || defined(ANDROID)
+#ifndef VK_USE_PLATFORM_ANDROID_KHR
 #define VK_USE_PLATFORM_ANDROID_KHR
+#endif
 #elif defined(_WIN64)
 #define VK_USE_PLATFORM_WIN32_KHR
 #elif defined(__APPLE__)
@@ -65,7 +67,16 @@ vk::SurfaceKHR CreateSurface(vk::Instance instance, const Frontend::WindowSDL& e
     const auto& window_info = emu_window.GetWindowInfo();
     vk::SurfaceKHR surface{};
 
-#if defined(VK_USE_PLATFORM_WIN32_KHR)
+#if defined(VK_USE_PLATFORM_ANDROID_KHR)
+    if (window_info.type == Frontend::WindowSystemType::Android) {
+        const vk::AndroidSurfaceCreateInfoKHR android_ci = {
+            .window = static_cast<ANativeWindow*>(window_info.render_surface),
+        };
+        const auto result = instance.createAndroidSurfaceKHR(&android_ci, nullptr, &surface);
+        ASSERT_MSG(result == vk::Result::eSuccess,
+                   "Failed to initialize Android Vulkan surface: {}", vk::to_string(result));
+    }
+#elif defined(VK_USE_PLATFORM_WIN32_KHR)
     if (window_info.type == Frontend::WindowSystemType::Windows) {
         const vk::Win32SurfaceCreateInfoKHR win32_ci = {
             .hinstance = static_cast<HINSTANCE>(window_info.display_connection),
@@ -173,7 +184,11 @@ std::vector<const char*> GetInstanceExtensions(Frontend::WindowSystemType window
     switch (window_type) {
     case Frontend::WindowSystemType::Headless:
         break;
-#if defined(VK_USE_PLATFORM_WIN32_KHR)
+#if defined(VK_USE_PLATFORM_ANDROID_KHR)
+    case Frontend::WindowSystemType::Android:
+        extensions.push_back(VK_KHR_ANDROID_SURFACE_EXTENSION_NAME);
+        break;
+#elif defined(VK_USE_PLATFORM_WIN32_KHR)
     case Frontend::WindowSystemType::Windows:
         extensions.push_back(VK_KHR_WIN32_SURFACE_EXTENSION_NAME);
         break;
@@ -272,7 +287,12 @@ vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool e
     setenv("VK_DRIVER_FILES", icd_path.c_str(), true);
 #endif
 
+#ifdef __ANDROID__
+    // Android has libvulkan.so, never the desktop libvulkan.so.1 soname.
+    static vk::detail::DynamicLoader dl("libvulkan.so");
+#else
     static vk::detail::DynamicLoader dl;
+#endif
     VULKAN_HPP_DEFAULT_DISPATCHER.init(
         dl.getProcAddress<PFN_vkGetInstanceProcAddr>("vkGetInstanceProcAddr"));
 

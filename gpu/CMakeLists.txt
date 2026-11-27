@@ -2,6 +2,9 @@
 # drivers, adapted to the native_probe runtime through shims in shim/.
 cmake_minimum_required(VERSION 3.24)
 project(bbgpu LANGUAGES C CXX)
+if (ANDROID)
+    include(cmake/AndroidDependencies.cmake)
+endif()
 option(BB_DIAGNOSTICS "Build capture, profiling and trace support" OFF)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -48,7 +51,9 @@ endif()
 
 find_package(Vulkan REQUIRED)
 find_package(fmt REQUIRED)
-find_package(Boost REQUIRED)
+if (NOT TARGET Boost::headers)
+    find_package(Boost REQUIRED)
+endif()
 # bbport (Windows): MSYS2 has no magic_enum/miniz packages; the submodules are used instead.
 find_package(magic_enum QUIET)
 if (NOT magic_enum_FOUND)
@@ -68,8 +73,10 @@ if (NOT VulkanMemoryAllocator_FOUND)
 endif()
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(XXHASH REQUIRED IMPORTED_TARGET libxxhash)
-pkg_check_modules(SDL3 REQUIRED IMPORTED_TARGET sdl3)
-if (NOT WIN32)
+if (NOT ANDROID)
+    pkg_check_modules(SDL3 REQUIRED IMPORTED_TARGET sdl3)
+endif()
+if (NOT WIN32 AND NOT ANDROID)
     pkg_check_modules(X11 REQUIRED IMPORTED_TARGET x11)
 endif()
 find_package(miniz QUIET)
@@ -84,7 +91,7 @@ if (NOT miniz_FOUND)
     add_library(miniz::miniz ALIAS miniz)
 endif()
 find_package(Zydis REQUIRED)
-find_program(GLSLANG_COMPILER NAMES glslang glslangValidator REQUIRED)
+find_program(GLSLANG_COMPILER NAMES glslang glslangValidator REQUIRED NO_CMAKE_FIND_ROOT_PATH)
 
 set(SIRIT_USE_SYSTEM_SPIRV_HEADERS OFF CACHE BOOL "" FORCE)
 add_subdirectory(third_party/sirit EXCLUDE_FROM_ALL)
@@ -167,9 +174,14 @@ set(COMMON
 file(GLOB AVPLAYER CONFIGURE_DEPENDS shadps4/core/libraries/avplayer/*.cpp)
 pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET libavformat libavcodec libavutil libswscale libswresample)
 file(GLOB SHIM_SOURCES CONFIGURE_DEPENDS shim/*.cpp shim/*/*.cpp)
+if (ANDROID)
+    list(FILTER SHIM_SOURCES EXCLUDE REGEX "/window\\.cpp$")
+else()
+    list(FILTER SHIM_SOURCES EXCLUDE REGEX "/window_android\\.cpp$")
+endif()
 # Windows: a DLL cannot leave the runtime_* symbols for DriveClubGame.exe to resolve, so the
 # library is static there and linked into the executable.
-if (WIN32)
+if (WIN32 OR ANDROID)
     set(BBGPU_KIND STATIC)
 else()
     set(BBGPU_KIND SHARED)
@@ -201,11 +213,21 @@ if (NOT Protobuf_FOUND)
             IMPORTED_LOCATION "${Protobuf_PROTOC_EXECUTABLE}")
     endif()
 endif()
+if (ANDROID)
+    # protoc is a build-host program. The target libprotobuf is Bionic ARM64.
+    # Never execute a cross-compiled protoc from an imported package target.
+    set(BB_PROTOC "${DRIVECLUB_ANDROID_DEPS}/../host/bin/protoc")
+    if (NOT EXISTS "${BB_PROTOC}")
+        message(FATAL_ERROR "Missing host protoc; run android/tools/fetch-gpu-deps.sh")
+    endif()
+else()
+    set(BB_PROTOC protobuf::protoc)
+endif()
 set(SHADNET_PROTO_OUT "${CMAKE_CURRENT_BINARY_DIR}/shadnet_proto_gen")
 file(MAKE_DIRECTORY "${SHADNET_PROTO_OUT}")
 add_custom_command(
     OUTPUT "${SHADNET_PROTO_OUT}/shadnet.pb.cc" "${SHADNET_PROTO_OUT}/shadnet.pb.h"
-    COMMAND protobuf::protoc "--proto_path=${CMAKE_CURRENT_SOURCE_DIR}/shadps4/shadnet"
+    COMMAND ${BB_PROTOC} "--proto_path=${CMAKE_CURRENT_SOURCE_DIR}/shadps4/shadnet"
             "--cpp_out=${SHADNET_PROTO_OUT}" "${CMAKE_CURRENT_SOURCE_DIR}/shadps4/shadnet/shadnet.proto"
     DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shadps4/shadnet/shadnet.proto")
 file(GLOB_RECURSE BBNET_SOURCES CONFIGURE_DEPENDS shadps4/core/libraries/network/*.cpp
@@ -268,20 +290,29 @@ target_compile_definitions(bbgpu PRIVATE BOOST_ASIO_STANDALONE NDEBUG)
 target_compile_definitions(bbgpu PRIVATE BB_DIAGNOSTICS=$<BOOL:${BB_DIAGNOSTICS}>)
 target_compile_options(bbgpu PRIVATE -Wno-deprecated-declarations -Wno-missing-field-initializers)
 # Runtime symbols (runtime_memory_*, runtime_process_*) resolve against DriveClubGame.
-if (NOT WIN32)
+if (NOT WIN32 AND NOT ANDROID)
     target_link_options(bbgpu PRIVATE -Wl,--allow-shlib-undefined)
 endif()
 target_link_libraries(bbgpu PRIVATE ffx-vulkan::portable ffx-vulkan::fsr4-v07-vulkan
     ffx-vulkan::fsr3-vk-framegeneration-3.1.6)
 target_link_libraries(bbgpu PUBLIC Vulkan::Headers fmt::fmt Boost::headers magic_enum::magic_enum
-    tsl::robin_map GPUOpen::VulkanMemoryAllocator PkgConfig::XXHASH PkgConfig::SDL3 PkgConfig::FFMPEG miniz::miniz Zydis::Zydis sirit)
+    tsl::robin_map GPUOpen::VulkanMemoryAllocator PkgConfig::XXHASH PkgConfig::FFMPEG miniz::miniz Zydis::Zydis sirit)
+if (ANDROID)
+    # The real renderer and HLE are linked into the runtime JNI library. Window
+    # and input ownership stay in the Android Activity; no SDLActivity/X server.
+    target_compile_definitions(bbgpu PUBLIC ANDROID VK_USE_PLATFORM_ANDROID_KHR)
+    target_link_libraries(bbgpu PUBLIC android log dl atomic Vulkan::Vulkan)
+    target_link_options(bbgpu INTERFACE -Wl,-z,max-page-size=16384)
+else()
+    target_link_libraries(bbgpu PUBLIC PkgConfig::SDL3)
+endif()
 if (WIN32)
     # Guest code is entered with the System V ABI; NOMINMAX/WIN32_LEAN_AND_MEAN keep
     # <windows.h> out of the way of std::min/max and the Vulkan/SDL headers.
     target_compile_definitions(bbgpu PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN)
     target_compile_options(bbgpu PRIVATE -include ${CMAKE_CURRENT_SOURCE_DIR}/shim/bb_win_compat.h)
     target_link_libraries(bbgpu PUBLIC Vulkan::Vulkan ws2_32 bcrypt ntdll synchronization winmm)
-else()
+elseif (NOT ANDROID)
     # The Vulkan loader is the host's; recording it as a dependency keeps libbbgpu loadable
     # when the executable is linked with --as-needed.
     target_link_libraries(bbgpu PUBLIC PkgConfig::X11 Vulkan::Vulkan)

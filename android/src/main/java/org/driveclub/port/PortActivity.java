@@ -23,13 +23,20 @@ public final class PortActivity extends Activity {
 
     private static native String probeGraphics();
     static native String inspect(byte[] sfo);
+    private static boolean nativeReady;
+    static boolean nativeAvailable() { return nativeReady; }
+    private long hostPageSize;
 
     private static final int SFO = 1, BASE = 2, UPDATE = 3, EXPORT_LOG = 4;
     private static final int BG = 0xff101116, PANEL = 0xff202128, RED = 0xffff394e,
             WHITE = 0xfffafafa, MUTED = 0xffc0c1ca;
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
     private GameLibrary library;
-    private String localStatus = "Execução do jogo em desenvolvimento.";
+    private String localStatus = "Selecione o jogo base e a atualização para preparar neste aparelho.";
+    private java.nio.file.Path prepared;
+    private boolean preparing;
+    private boolean gameLaunched;
+    private Button play, rebuild;
     private TextView preparation;
     private PortLog log;
     private LinearLayout page, tabs, content;
@@ -43,8 +50,16 @@ public final class PortActivity extends Activity {
         log = new PortLog(this);
         log.session(this);
         log.write("JNI", "Carregando biblioteca nativa");
-        System.loadLibrary("driveclub_android");
+        try {
+            System.loadLibrary("driveclub_android");
+            nativeReady = true;
+        } catch (LinkageError e) {
+            log.write("JNI", e.toString());
+            localStatus = "Falha ao carregar a biblioteca nativa. Consulte os logs.";
+        }
         library = new GameLibrary(this);
+        hostPageSize = android.system.Os.sysconf(android.system.OsConstants._SC_PAGESIZE);
+        log.write("Memória", "Página do sistema: " + hostPageSize + " bytes");
         system = state != null && state.getBoolean("system");
         ScrollView scroll = new ScrollView(this);
         scroll.setBackgroundColor(BG);
@@ -61,7 +76,7 @@ public final class PortActivity extends Activity {
         setContentView(scroll);
         render();
         prepareLocal(false);
-        worker.execute(() -> {
+        if (nativeReady) worker.execute(() -> {
             log.write("Vulkan", "Consultando dispositivos");
             String value = probeGraphics();
             log.write("Vulkan", value);
@@ -144,7 +159,7 @@ public final class PortActivity extends Activity {
         return box;
     }
 
-    private void action(LinearLayout box, String label, Runnable callback) {
+    private Button action(LinearLayout box, String label, Runnable callback) {
         Button button = new Button(this, null, android.R.attr.borderlessButtonStyle);
         button.setAllCaps(false);
         button.setText(label);
@@ -154,6 +169,7 @@ public final class PortActivity extends Activity {
         button.setMinHeight(dp(48));
         button.setOnClickListener(v -> callback.run());
         box.addView(button);
+        return button;
     }
 
     private void body() {
@@ -162,9 +178,15 @@ public final class PortActivity extends Activity {
         tab("Sistema", true);
         content.removeAllViews();
         pad = null;
+        play = null;
+        rebuild = null;
+        preparation = null;
         if (system) {
             LinearLayout device = card("Dispositivo");
             device.addView(text(Build.MANUFACTURER + " " + Build.MODEL + "  ·  Android " + Build.VERSION.RELEASE, 15, MUTED, false));
+            device.addView(text("Página de memória: " + hostPageSize + " bytes", 14, MUTED, false));
+            if (hostPageSize != 4096)
+                device.addView(text("O renderizador desta versão exige páginas de 4 KB.", 14, RED, false));
             LinearLayout graphics = card("Processador gráfico");
             graphics.addView(text(gpu, 16, WHITE, false));
             LinearLayout logs = card("Diagnóstico");
@@ -180,29 +202,55 @@ public final class PortActivity extends Activity {
         } else {
             folderCard("Jogo base", GameLibrary.BASE, BASE);
             folderCard("Atualização 1.28", GameLibrary.UPDATE, UPDATE);
+            LinearLayout launch = card("Jogar");
+            play = action(launch, "Iniciar Driveclub", this::startGame);
+            rebuild = action(launch, "Preparar novamente", () -> prepareLocal(true));
             preparation = text(localStatus, 14, MUTED, false);
             content.addView(preparation);
+            updateActions();
         }
     }
 
     private void prepareLocal(boolean refresh) {
         Uri base = library.folder(GameLibrary.BASE);
         Uri update = library.folder(GameLibrary.UPDATE);
-        if (base == null || update == null) return;
+        if (!nativeReady || base == null || update == null) return;
+        prepared = null;
+        preparing = true;
         setPreparation("Verificando os arquivos locais…");
         worker.execute(() -> {
             try {
-                LocalGame.prepare(getApplicationContext(), library, base, update, refresh, log);
+                java.nio.file.Path ready = LocalGame.prepare(getApplicationContext(), library, base, update, refresh, log,
+                        (stage, message) -> {
+                            String[] steps = {"Verificando as pastas…", "Lendo os módulos…", "Convertendo o executável…",
+                                    "Vinculando os módulos…", "Preparando o conteúdo…", "Aplicando os patches…", "Preparação concluída."};
+                            String status = stage >= 0 && stage < steps.length ? steps[stage] : message;
+                            log.write("Preparação local", status);
+                            runOnUiThread(() -> {
+                                if (!isDestroyed() && base.equals(library.folder(GameLibrary.BASE))
+                                        && update.equals(library.folder(GameLibrary.UPDATE))) setPreparation(status);
+                            });
+                        });
                 runOnUiThread(() -> {
-                    if (base.equals(library.folder(GameLibrary.BASE)) && update.equals(library.folder(GameLibrary.UPDATE)))
-                        setPreparation("Arquivos preparados neste aparelho. Execução em desenvolvimento.");
+                    if (!isDestroyed() && base.equals(library.folder(GameLibrary.BASE))
+                            && update.equals(library.folder(GameLibrary.UPDATE))) {
+                        prepared = ready;
+                        preparing = false;
+                        setPreparation(ready == null ? "Selecione novamente as pastas do jogo." :
+                                BuildConfig.GAME_RUNTIME ? (hostPageSize == 4096 ?
+                                        "Pronto para iniciar. Os arquivos foram preparados neste aparelho." :
+                                        "Preparação concluída. O renderizador ainda não suporta o tamanho de página deste aparelho.") :
+                                "Preparação concluída. Esta compilação de teste não contém o runtime ARM64.");
+                    }
                 });
             } catch (IOException | RuntimeException e) {
                 String message = e.getMessage();
                 log.write("Preparação local", message == null ? e.getClass().getSimpleName() : message);
                 runOnUiThread(() -> {
-                    if (base.equals(library.folder(GameLibrary.BASE)) && update.equals(library.folder(GameLibrary.UPDATE)))
+                    if (!isDestroyed() && base.equals(library.folder(GameLibrary.BASE)) && update.equals(library.folder(GameLibrary.UPDATE))) {
+                        preparing = false;
                         setPreparation("Falha na preparação local. Consulte os logs.");
+                    }
                 });
             }
         });
@@ -211,6 +259,22 @@ public final class PortActivity extends Activity {
     private void setPreparation(String text) {
         localStatus = text;
         if (preparation != null) preparation.setText(text);
+        updateActions();
+    }
+
+    private void updateActions() {
+        if (play != null) play.setEnabled(nativeReady && BuildConfig.GAME_RUNTIME && hostPageSize == 4096 && prepared != null && !preparing);
+        if (rebuild != null) rebuild.setEnabled(nativeReady && !preparing
+                && library.folder(GameLibrary.BASE) != null && library.folder(GameLibrary.UPDATE) != null);
+    }
+
+    private void startGame() {
+        if (prepared == null || preparing || !BuildConfig.GAME_RUNTIME) return;
+        log.write("Execução", "Iniciando Driveclub com Bionic e FEX no processo do jogo");
+        gameLaunched = true;
+        startActivity(new Intent(this, GameActivity.class).putExtra("prepared", prepared.toString())
+                .putExtra("base", library.folder(GameLibrary.BASE).toString())
+                .putExtra("update", library.folder(GameLibrary.UPDATE).toString()));
     }
 
     private void folderCard(String title, String key, int request) {
@@ -308,6 +372,14 @@ public final class PortActivity extends Activity {
     @Override protected void onSaveInstanceState(Bundle state) {
         super.onSaveInstanceState(state);
         state.putBoolean("system", system);
+    }
+
+    @Override protected void onResume() {
+        super.onResume();
+        if (gameLaunched) {
+            gameLaunched = false;
+            worker.execute(() -> log.recordExits(this));
+        }
     }
 
     @Override protected void onDestroy() {

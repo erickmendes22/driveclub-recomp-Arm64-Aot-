@@ -12,6 +12,7 @@
 #include "common/error.h"
 #include "common/range_lock.h"
 #include "common/signal_context.h"
+#include "common/spin_lock.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
 #include "core/signals.h"

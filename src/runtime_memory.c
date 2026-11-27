@@ -45,11 +45,13 @@ static uint64_t pool_size_bytes(void) {
 #define NO_MEMORY ((int32_t)UINT32_C(0x8002000c))
 #define ACCESS ((int32_t)UINT32_C(0x8002000d))
 #define NO_SPACE ((int32_t)UINT32_C(0x80020023))
+#define BAD_ADDRESS ((int32_t)UINT32_C(0x8002000e))
+#define NAME_TOO_LONG ((int32_t)UINT32_C(0x8002003f))
 #define MAP_FIXED_FLAG 0x10
 #define MAP_NO_OVERWRITE 0x80
 enum { KIND_RESERVED=1, KIND_DIRECT, KIND_FLEXIBLE };
 typedef struct { uint64_t start, size; int type, used; } Block;
-typedef struct { uintptr_t start, end; int kind, prot, type; uint64_t phys; } Vma;
+typedef struct { uintptr_t start, end; int kind, prot, type; uint64_t phys; char name[32]; } Vma;
 typedef struct {
     uintptr_t start, end; uint64_t offset; int32_t protection, memory_type;
     uint32_t flags; char name[32];
@@ -409,9 +411,10 @@ static int split_at(uintptr_t a) {
     if (i==vma_count || vmas[i].start>=a) return 0;
     Vma right=vmas[i];
     right.start=a;
-    if (right.kind==KIND_DIRECT) right.phys+=a-vmas[i].start;
+    if (right.kind!=KIND_RESERVED) right.phys+=a-vmas[i].start;
+    if (vma_insert(i+1,right)) return -1;
     vmas[i].end=a;
-    return vma_insert(i+1,right);
+    return 0;
 }
 /* Range [start,end) split on its edges; returns the first index inside it. */
 static size_t carve(uintptr_t start, uintptr_t end, int *error) {
@@ -465,7 +468,9 @@ static int32_t place(void **inout, uint64_t size, int prot, int flags, uint64_t 
     if (host_map(address,size,host_prot(prot),kind==KIND_RESERVED,phys)) return mem_fail(NO_MEMORY, __LINE__);
     void *mapped=(void *)address;
     drop_range(address,address+size);
-    if (vma_insert(vma_index(address),(Vma){address,address+size,kind,prot,type,phys})) return mem_fail(NO_MEMORY, __LINE__);
+    Vma region={address,address+size,kind,prot,type,phys,{0}};
+    strcpy(region.name,kind==KIND_RESERVED ? "reserved" : kind==KIND_DIRECT ? "direct" : "flexible");
+    if (vma_insert(vma_index(address),region)) return mem_fail(NO_MEMORY, __LINE__);
     if (kind==KIND_FLEXIBLE) flexible_bytes+=size;
     if (kind!=KIND_RESERVED) queue_hook(HOOK_MAP,address,size);
     *inout=mapped;
@@ -690,6 +695,34 @@ static ABI int32_t query_protection(void *address, void **start, void **end, uin
     read_unlock();
     return 0;
 }
+/* Names are guest metadata, including for memfd-backed direct memory where the
+ * Linux anonymous-VMA naming prctl cannot be used. Keep them on each VMA so
+ * VirtualQuery reports the name after splits, protection changes and unmaps.
+ * The kernel API uses 31 characters plus NUL and PS4 16 KiB range granularity. */
+static ABI int32_t set_virtual_range_name(const void *address, uint64_t size, const char *name) {
+    if (!name) return BAD_ADDRESS;
+    size_t length=strnlen(name,32);
+    if (length>=32) return NAME_TOO_LONG;
+    uintptr_t start=(uintptr_t)address & ~(uintptr_t)(PAGE-1);
+    if (!size || size>UINT64_MAX-(PAGE-1)) return INVALID;
+    size=align_up(size,PAGE);
+    if (start<USER_MIN || start>=USER_MAX || size>USER_MAX-start) return INVALID;
+    uintptr_t end=start+size;
+    write_lock();
+    if (!covered(start,end,1)) { write_unlock(); return INVALID; }
+    int error;
+    size_t i=carve(start,end,&error);
+    if (error) { write_unlock(); return mem_fail(NO_MEMORY, __LINE__); }
+    for (; i<vma_count && vmas[i].start<end; ++i) {
+        memset(vmas[i].name,0,sizeof(vmas[i].name));
+        memcpy(vmas[i].name,name,length);
+    }
+    write_unlock();
+    return 0;
+}
+static ABI int32_t clear_virtual_range_name(const void *address, uint64_t size) {
+    return set_virtual_range_name(address,size,"");
+}
 static ABI int32_t virtual_query(const void *address, int flags, VirtualQueryInfo *info, uint64_t info_size) {
     if (!info || info_size!=sizeof(*info)) return INVALID;
     read_lock();
@@ -701,7 +734,7 @@ static ABI int32_t virtual_query(const void *address, int flags, VirtualQueryInf
     info->offset=v.kind==KIND_DIRECT ? v.phys : 0;
     info->protection=v.prot; info->memory_type=v.type;
     info->flags=(v.kind==KIND_FLEXIBLE ? 1u : 0) | (v.kind==KIND_DIRECT ? 2u : 0) | (v.kind!=KIND_RESERVED ? 16u : 0);
-    strcpy(info->name, v.kind==KIND_RESERVED ? "reserved" : v.kind==KIND_DIRECT ? "direct" : "flexible");
+    memcpy(info->name,v.name,sizeof(info->name));
     __atomic_add_fetch(&queries,1,__ATOMIC_RELAXED);
     read_unlock();
     return 0;
@@ -749,6 +782,7 @@ static const RuntimeExport exports[]={
     {"sceKernelReleaseFlexibleMemory",release_flexible}, {"sceKernelReserveVirtualRange",reserve_range},
     {"sceKernelMprotect",kernel_mprotect}, {"sceKernelQueryMemoryProtection",query_protection},
     {"sceKernelVirtualQuery",virtual_query}, {"sceKernelGetDirectMemoryType",direct_memory_type},
+    {"sceKernelSetVirtualRangeName",set_virtual_range_name}, {"sceKernelClearVirtualRangeName",clear_virtual_range_name},
     {"sceKernelBatchMap",batch_map}, {"sceKernelBatchMap2",batch_map2},
 };
 uintptr_t runtime_memory_resolve(const char *name) {
@@ -758,34 +792,12 @@ uintptr_t runtime_memory_resolve(const char *name) {
     if (nid_match(name, "L-Q3LEjIbgA#p#J")) return (uintptr_t)direct_map;
     if (nid_match(name, "MBuItvba6z8#p#J")) return (uintptr_t)direct_release;
     if (nid_match(name, "cQke9UuBQOk#p#J")) return (uintptr_t)direct_unmap;
+    if (nid_match(name, "DGMG3JshrZU")) return (uintptr_t)set_virtual_range_name;
+    if (nid_match(name, "mkgXxsoxWHg")) return (uintptr_t)clear_virtual_range_name;
     return RUNTIME_LOOKUP(exports,name);
 }
-/* Host-owned memory the guest can see (image, stacks, trampolines) lives in
- * [LOW_MIN, USER_MIN): PS4 code packs pointers into 40-bit fields. */
-#define LOW_MIN UINT64_C(0x0800000000)
-static uintptr_t low_next=LOW_MIN;
-void *runtime_low_map(size_t size, int prot) {
-    size=align_up(size,PAGE);
-    write_lock();
-#ifdef _WIN32
-    void *p=NULL;
-    while (!p && low_next+size<=USER_MIN) {
-        p=VirtualAlloc((void *)low_next,size,MEM_RESERVE|MEM_COMMIT,win_prot(prot));
-        low_next+=size+UINT64_C(65536); /* unmapped gap catches overruns; allocation granularity */
-    }
-    write_unlock();
-    return p;
-#else
-    void *p=MAP_FAILED;
-    while (low_next+size<=USER_MIN) {
-        p=mmap((void *)low_next,size,prot,MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED_NOREPLACE,-1,0);
-        low_next+=size+PAGE; /* unmapped gap catches overruns */
-        if (p!=MAP_FAILED) break;
-    }
-    write_unlock();
-    return p==MAP_FAILED ? NULL : p;
-#endif
-}
+/* Host-owned low-address allocations are independent of the PS4 VMA table;
+ * runtime_low_memory.c also supplies them to the standalone FEX ABI test. */
 /* ---- GPU library interface (gpu/shim/bbgpu.cpp) ---- */
 /* Optimizations switched off at run time (diagnostics): the number in the file named by
  * BB_TOGGLE_FILE, re-read every 250 ms. Bits: 1 region cache, 2 fetch shader cache,

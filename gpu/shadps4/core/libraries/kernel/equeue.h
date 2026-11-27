@@ -12,6 +12,9 @@
 #include <unordered_map>
 #include "common/rdtsc.h"
 #include "common/types.h"
+#ifdef __ANDROID__
+#include "core/libraries/kernel/time.h"
+#endif
 
 namespace Core::Loader {
 class SymbolsResolver;
@@ -117,7 +120,11 @@ struct EqueueEvent {
             auto event_hint_raw = reinterpret_cast<u64>(data);
             auto event_hint = static_cast<OrbisVideoOutEventHint>(event_hint_raw);
             if (event_hint.event_id == event.ident && event.ident != 0xfe) {
+#ifdef __ANDROID__
+                auto time = sceKernelReadTsc();
+#else
                 auto time = Common::FencedRDTSC();
+#endif
                 auto counter = event_data.count;
                 if (counter != 0xf) {
                     counter++;

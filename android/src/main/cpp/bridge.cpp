@@ -7,6 +7,8 @@
 extern "C" decltype(&guest_cpu_call_xmm) const driveclub_fex_call_xmm = guest_cpu_call_xmm;
 #endif
 #include <vulkan/vulkan.h>
+#include <exception>
+#include <stdexcept>
 #include <string>
 
 extern "C" JNIEXPORT jstring JNICALL
@@ -53,12 +55,34 @@ Java_org_driveclub_port_PortActivity_inspect(JNIEnv* env, jclass, jbyteArray byt
 }
 
 extern "C" JNIEXPORT jstring JNICALL
-Java_org_driveclub_port_LocalGame_prepareNative(JNIEnv* env, jclass, jstring path) {
+Java_org_driveclub_port_LocalGame_prepareNative(JNIEnv* env, jclass, jstring path, jobject progress) {
     const char* raw = env->GetStringUTFChars(path, nullptr);
     if (!raw) return nullptr;
     std::filesystem::path root(raw);
     env->ReleaseStringUTFChars(path, raw);
-    const auto error = PrepareGame(root / "update", root / "base", root / "work",
-                                   root / "patches.xml", false, [](int, const std::string&) {});
-    return env->NewStringUTF(error.c_str());
+    jmethodID update = nullptr;
+    if (progress) {
+        jclass cls = env->GetObjectClass(progress);
+        update = env->GetMethodID(cls, "update", "(ILjava/lang/String;)V");
+        env->DeleteLocalRef(cls);
+        if (!update || env->ExceptionCheck()) return nullptr;
+    }
+    try {
+        const auto error = PrepareGame(root / "update", root / "base", root / "work",
+                root / "patches.xml", false, [&](int percent, const std::string& message) {
+                    if (!progress) return;
+                    jstring text = env->NewStringUTF(message.c_str());
+                    if (!text) throw std::runtime_error("Falha ao comunicar progresso da preparação");
+                    env->CallVoidMethod(progress, update, percent, text);
+                    env->DeleteLocalRef(text);
+                    if (env->ExceptionCheck()) throw std::runtime_error("Preparação interrompida");
+                });
+        return env->NewStringUTF(error.c_str());
+    } catch (const std::exception& error) {
+        if (env->ExceptionCheck()) return nullptr;
+        return env->NewStringUTF(error.what());
+    } catch (...) {
+        if (env->ExceptionCheck()) return nullptr;
+        return env->NewStringUTF("Falha nativa durante a preparação local");
+    }
 }

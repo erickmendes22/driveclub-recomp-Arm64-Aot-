@@ -171,7 +171,7 @@ void StartLocalPresencePoll() {
                 ev.targetUserId = 1; // the local account's user
                 ev.npServiceName = "inGamePresence";
                 ev.hasFrom = true;
-                std::snprintf(ev.fromOnlineId.data, sizeof(ev.fromOnlineId.data) + 1, "%s", name.c_str());
+                SetNpOnlineId(ev.fromOnlineId, name);
                 const std::string status_json =
                     "\"gameStatus\":\"" + PresenceEscape(online ? (status.empty() ? "In the menus" : status) : "") + "\"";
                 ev.dataType = "np:service:presence:onlineStatus";

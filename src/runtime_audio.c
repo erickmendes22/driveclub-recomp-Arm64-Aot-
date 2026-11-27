@@ -14,7 +14,11 @@
 #include <string.h>
 #include <pthread.h>
 #include <time.h>
+#ifdef __ANDROID__
+#include "runtime_audio_android.inc"
+#else
 #include <SDL3/SDL.h>
+#endif
 
 #define PORTS 25
 #define ERR_NOT_OPENED ((int32_t)0x80260001)
@@ -129,7 +133,7 @@ static ABI int32_t audio_open(int32_t user, int32_t type, int32_t index, uint32_
         }
         p->stream=SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK,&spec,NULL,NULL);
         if (p->stream) SDL_ResumeAudioStreamDevice(p->stream);
-        else fprintf(stderr,"Runtime: SDL audio stream failed (%s); port %d uses the timer sink\n",SDL_GetError(),id);
+        else fprintf(stderr,"Runtime: audio stream failed (%s); port %d uses the timer sink\n",SDL_GetError(),id);
     }
     p->stats=BB_DIAGNOSTIC_ENV("BB_AUDIO_STATS")!=NULL;
     const char *dump=BB_DIAGNOSTIC_ENV("BB_AUDIO_DUMP");

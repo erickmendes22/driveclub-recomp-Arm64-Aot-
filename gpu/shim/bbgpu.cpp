@@ -25,8 +25,11 @@
 #include <chrono>
 #include <thread>
 #include <vector>
+#ifndef __ANDROID__
 #include <SDL3/SDL.h>
+#endif
 #include "../bbgpu.h"
+#include "../../src/guest_cpu.h"
 #include "common/elf_info.h"
 #include "common/logging/log.h"
 #include "common/rdtsc.h"
@@ -196,7 +199,15 @@ boost::icl::interval_set<VAddr> AddressSpace::GetUsableRegions() {
 // Kernel services the vendored libraries call directly.
 namespace Libraries::Kernel {
 u64 PS4_SYSV_ABI sceKernelGetTscFrequency() { return runtime_tsc_frequency(); }
-u64 PS4_SYSV_ABI sceKernelReadTsc() { return Common::FencedRDTSC(); }
+u64 PS4_SYSV_ABI sceKernelReadTsc() {
+#ifdef __ANDROID__
+    // FEX can scale the hardware counter. VideoOut timestamps returned to the
+    // guest must use the same clock and frequency as its RDTSC instructions.
+    return guest_cpu_tsc();
+#else
+    return Common::FencedRDTSC();
+#endif
+}
 u64 PS4_SYSV_ABI sceKernelGetProcessTime() { return runtime_process_time_us(); }
 u64 PS4_SYSV_ABI sceKernelGetProcessTimeCounter() { return runtime_process_time_counter(); }
 u64 PS4_SYSV_ABI sceKernelGetProcessTimeCounterFrequency() { return 1'000'000'000; }
@@ -223,8 +234,12 @@ std::atomic<bool> g_window_shutdown{false};
 
 u32 BbDisplayRefreshHz() {
     static const u32 hz = [] {
+#ifdef __ANDROID__
+        const u32 rate = BbAndroid::DisplayRefreshHz();
+#else
         const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(SDL_GetPrimaryDisplay());
         const u32 rate = mode && mode->refresh_rate > 0 ? u32(mode->refresh_rate + 0.5f) : 60;
+#endif
         std::printf("GPU: vblank follows the display refresh rate, %u Hz\n", rate);
         return std::max<u32>(rate, 60);
     }();
@@ -309,7 +324,7 @@ extern "C" int bbgpu_init(const BbGpuConfig* config) {
         }
         g_window_cv.notify_all();
         while (!g_window_shutdown && window->PollEvents()) {
-            SDL_Delay(2);
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
         }
         if (g_window_shutdown) {
             delete window;

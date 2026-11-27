@@ -1,10 +1,15 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-    <application android:label="Driveclub Android" android:icon="@drawable/driveclub_icon" android:theme="@android:style/Theme.Material.NoActionBar">
+    <uses-permission android:name="android.permission.INTERNET"/>
+    <application android:label="Driveclub Android" android:icon="@drawable/driveclub_icon" android:theme="@android:style/Theme.Material.NoActionBar" android:allowBackup="false">
         <activity android:name=".PortActivity" android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN"/>
                 <category android:name="android.intent.category.LAUNCHER"/>
             </intent-filter>
         </activity>
+        <activity android:name=".GameActivity" android:exported="false" android:process=":runtime"
+            android:screenOrientation="sensorLandscape" android:launchMode="singleTask"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|density|uiMode"
+            android:enableOnBackInvokedCallback="false"/>
     </application>
 </manifest>
