@@ -11,7 +11,13 @@ query_node() {
     adb pull /sdcard/launcher-window.xml /tmp/launcher-window.xml >/dev/null
     python3 - "$1" "${2:-find}" <<'PY'
 import re, subprocess, sys, xml.etree.ElementTree as ET
-for n in ET.parse('/tmp/launcher-window.xml').iter('node'):
+nodes = list(ET.parse('/tmp/launcher-window.xml').iter('node'))
+if any(n.get('text') == "Pixel Launcher isn't responding" for n in nodes):
+    close = next(n for n in nodes if n.get('resource-id') == 'android:id/aerr_close')
+    l,t,r,b = map(int, re.findall(r'\d+', close.get('bounds')))
+    subprocess.run(['adb','shell','input','tap',str((l+r)//2),str((t+b)//2)],check=True)
+    sys.exit(1)
+for n in nodes:
     if sys.argv[1].casefold() in [n.get(k, '').casefold() for k in ('text', 'content-desc', 'resource-id')]:
         if sys.argv[2] == 'tap':
             l,t,r,b = map(int, re.findall(r'\d+', n.get('bounds')))
