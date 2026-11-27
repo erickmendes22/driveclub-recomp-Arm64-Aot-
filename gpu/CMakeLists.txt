@@ -303,6 +303,11 @@ if (ANDROID)
     target_compile_definitions(bbgpu PUBLIC ANDROID VK_USE_PLATFORM_ANDROID_KHR)
     target_link_libraries(bbgpu PUBLIC android log dl atomic Vulkan::Vulkan)
     target_link_options(bbgpu INTERFACE -Wl,-z,max-page-size=16384)
+    # FFmpeg's AArch64 assembly references internal lookup tables directly.
+    # Its PIC static archives live wholly inside our JNI DSO: keep those
+    # symbols local so the linker can resolve ADRP/ADD without text relocations.
+    target_link_options(bbgpu INTERFACE
+        "LINKER:--exclude-libs,libavformat.a:libavcodec.a:libavutil.a:libswscale.a:libswresample.a")
 else()
     target_link_libraries(bbgpu PUBLIC PkgConfig::SDL3)
 endif()

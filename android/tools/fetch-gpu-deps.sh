@@ -104,12 +104,10 @@ cm protobuf-21.12 "$src/protobuf-21.12/cmake" -DCMAKE_CXX_STANDARD=17 \
     -Dprotobuf_BUILD_PROTOC_BINARIES=OFF -Dprotobuf_WITH_ZLIB=OFF
 
 # Shader compilation runs on the build host. Never execute an ARM64 glslang or
-# accidentally pick a tool from the target sysroot. A supplied host binary is
-# also accepted (CI may install glslang-tools instead of building it).
+# accidentally pick a tool from the target sysroot. Build the pinned revision
+# unless the caller explicitly supplies a host binary.
 if [[ -n ${GLSLANG_COMPILER:-} ]]; then
     [[ -x "$GLSLANG_COMPILER" ]] || { echo "Invalid GLSLANG_COMPILER: $GLSLANG_COMPILER" >&2; exit 1; }
-elif command -v glslang >/dev/null 2>&1 || command -v glslangValidator >/dev/null 2>&1; then
-    : # GPU CMake's NO_CMAKE_FIND_ROOT_PATH search will resolve the host tool.
 elif [[ ! -x "$host/bin/glslang" ]]; then
     fetch glslang-15.4.0 https://github.com/KhronosGroup/glslang/archive/8a85691a0740d390761a1008b4696f57facd02c4.tar.gz
     cmake -S "$src/glslang-15.4.0" -B "$bld/glslang-host" -G Ninja \

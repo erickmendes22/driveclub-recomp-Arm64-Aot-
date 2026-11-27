@@ -213,41 +213,149 @@ The player release is built with link-time optimization and a recorded profile (
 
 To record a new profile after the code has changed a lot: build with `BB_PGO=generate BB_LTO=ON`, run the game's benchmark and a race or two with your usual settings (the profile is written every 30 seconds into `pgo/`), then merge the `.profraw` files with `llvm-profdata merge -output=pgo/default.profdata pgo/*.profraw`.
 
-## Android ARM64 bootstrap
+## Android ARM64 (Bionic and FEX)
 
-Open `android/` in Android Studio or run `cd android && ./gradlew assembleDebug` with
-JDK 17, SDK 35, NDK 27.2.12479018 and CMake 3.22.1. Install the debug APK on an
-arm64-v8a device running Android 11 or later with `./gradlew installDebug`.
-The Android ARM64 bootstrap workflow also builds the APK and archives it as
-`driveclub-android-arm64-debug`.
+The Android target integrates the local preparer, the Driveclub loader/HLE, FEXCore,
+and the existing shadPS4-based renderer. It targets `arm64-v8a`, Android 11/API 30
+or later, using Bionic throughout. Building the APK or passing synthetic CPU tests
+does not establish that the original game reaches its menu or gameplay; that
+requires an Android device run with the user's game files and its startup log.
 
-The app loads a native ARM64 library and enumerates Vulkan physical devices at startup.
-Optionally select the update's `sce_sys/param.sfo` with the system file picker.
-The PC preparation code identifies the US/EU title and update version from these bytes.
-The app currently implements diagnostics only. Guest CPU execution, game rendering and
-audio are pending. No game files are needed for the APK or the synthetic host test:
+### Build
 
-    c++ -std=c++20 tests/test_update_metadata.cpp launcher/prepare.cpp -o /tmp/test-metadata
-    /tmp/test-metadata
+Use a Linux x86_64 build host with JDK 17 or 21, Android SDK 35, Build Tools 35.0.0,
+NDK **29.0.14206865**, and CMake **3.31.6**. The scripts also need Git, a host C/C++
+compiler, Ninja, pkg-config, Python 3, curl, tar, make, Perl and unzip. Install the
+Android packages through Android Studio or `sdkmanager`:
 
-The ARM64 launcher layout and Gradle wrapper follow
+    sdkmanager "platforms;android-35" "build-tools;35.0.0" "ndk;29.0.14206865" "cmake;3.31.6"
+
+From the repository root:
+
+    export ANDROID_HOME=/path/to/android-sdk
+    export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/29.0.14206865"
+    export PATH="$ANDROID_HOME/cmake/3.31.6/bin:$PATH"
+    export CMAKE_BUILD_PARALLEL_LEVEL=3
+    android/tools/build-fex.sh
+    android/tools/fetch-gpu-deps.sh
+    (cd android && ./gradlew assembleDebug)
+    python3 android/tools/verify-apk.py android/build/outputs/apk/debug/driveclub-android-debug.apk
+
+`build-fex.sh` builds `out/android-fex/build/libbbcpu.so`. Despite its name,
+`fetch-gpu-deps.sh` also cross-compiles the renderer, media and network dependencies
+under `out/android-gpu/`; it keeps host shader/protobuf tools separate from Android
+libraries. Gradle then compiles and links the game runtime and packages it with the
+launcher and FEX. No game files are needed to build the APK. Install it with
+`cd android && ./gradlew installDebug` or `adb install -r` using the APK path above.
+
+The **Android Bionic FEX runtime** GitHub Actions workflow
+(`.github/workflows/android-bootstrap.yml`) can also be started with **Run workflow**.
+It builds and audits the APK and archives it as
+`driveclub-android-bionic-fex-arm64-debug`.
+
+### Local preparation and runtime
+
+Select the base and update directories in **Biblioteca**. The app retains read-only
+Storage Access Framework (SAF) grants and runs the shared `launcher/prepare.cpp`
+preparer on the device. The executable and modules are staged in a private generation;
+the resulting boot, content and patch files are created there. No prepared boot image
+is downloaded or distributed with the APK. `game000.dat` stays in the selected folder:
+preparation uses an open descriptor, and runtime reads/seeks use native descriptors
+opened through SAF. The provider must support seekable files; use a local device folder
+rather than a provider that exposes only streams.
+
+The last complete generation remains available if preparation fails. Saves and user
+data live in the separate private `driveclub/user` directory, outside `local-*`
+generations, so replacing a prepared generation does not remove saves.
+
+`GameActivity` runs in the dedicated `:runtime` process. Its JNI library enters the
+loader, FEX executes the original x86-64 code, and the renderer presents through
+`ANativeWindow` and Vulkan. Audio uses AAudio; touch buttons and Android gamepad
+buttons/axes feed the pad backend. A native exit or crash is contained in that
+process so the garage can be reopened. Android IME dialogs, steering-wheel support,
+force feedback and controller vibration are not implemented in this backend.
+
+In **Sistema → Diagnóstico**, **Ver logs** displays the history and **Exportar logs**
+saves `driveclub-diagnostico.txt`. The export includes launcher history and the current
+and previous native runtime logs. Reopen the app after a crash to export them; Android's
+previous-exit reason is included when the OS supplies it.
+
+### Device requirements and limits
+
+Game execution currently requires **4 KiB host pages**. The runtime rejects other
+page sizes before entering the loader because renderer memory tracking still uses
+4 KiB pages. The native ELF libraries use 16 KiB load alignment, and the downstream
+FEX guard-page patch uses the actual host page size; neither establishes renderer
+support for a 16 KiB Android kernel.
+
+The real renderer requires **Vulkan 1.3**, an Android presentation surface, and its
+required device extensions: `VK_KHR_swapchain`, `VK_KHR_push_descriptor`,
+`VK_EXT_vertex_attribute_divisor` and `VK_EXT_robustness2`. The latter must expose
+`robustBufferAccess2`, `robustImageAccess2` and `nullDescriptor`. A successful launcher
+Vulkan probe alone does not prove that those renderer requirements are satisfied.
+
+### Verification
+
+Run the host contract tests from the repository root without game files:
+
+    mkdir -p out/android-tests
+    c++ -std=c++20 tests/test_update_metadata.cpp launcher/prepare.cpp -o out/android-tests/test-metadata
+    out/android-tests/test-metadata
+    cc -std=c11 -D__ANDROID__ -DDRIVECLUB_ANDROID_RUNTIME=1 -I. -Isrc \
+      tests/test_android_runtime_io.c src/runtime_file.c src/runtime_pad_android.c \
+      -pthread -lm -o out/android-tests/test-android-io
+    out/android-tests/test-android-io
+    cc -std=c11 -O2 -ffunction-sections -fdata-sections -pthread \
+      tests/test_runtime_memory.c -Wl,--gc-sections -o out/android-tests/test-runtime-memory
+    out/android-tests/test-runtime-memory
+
+These cover metadata, large-file descriptor I/O, directory/stat handling, read-only
+content, save paths, pad input, and virtual-range naming/bounds/backing offsets.
+`verify-apk.py` audits the actual packaged ARM64 ELF files, JNI/CPU exports, Android
+dependency closure and 16 KiB load alignment; it also rejects packaged game data.
+
+Build the FEX ABI test against the backend extracted from the APK:
+
+    android/tools/build-runtime-core.sh
+    mkdir -p out/fex-test
+    unzip -jo android/build/outputs/apk/debug/driveclub-android-debug.apk \
+      'lib/arm64-v8a/libbbcpu.so' 'lib/arm64-v8a/libc++_shared.so' -d out/fex-test
+    "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android30-clang++" \
+      -std=c++20 tests/test_android_fex.cpp out/android-runtime/libdriveclub-runtime.a \
+      -Wl,--gc-sections -Wl,-z,max-page-size=16384 -Lout/fex-test -lbbcpu -o out/fex-test/test-fex
+
+For a host-side run, obtain the pinned official Android API 30 ARM64 Bionic runtime
+with `fetch-bionic-runtime.py`. Extraction needs `debugfs` from `e2fsprogs` and about
+4 GB of temporary disk space. An x86_64 host also needs `qemu-aarch64` or
+`qemu-aarch64-static`:
+
+    python3 android/tools/fetch-bionic-runtime.py --output out/android-bionic
+    python3 android/tools/run-bionic-test.py --runtime out/android-bionic \
+      --qemu /path/to/qemu-aarch64-static out/fex-test/test-fex
+
+QEMU **10.0.13** was validated with this synthetic ABI test and API 30 Bionic.
+QEMU 7.2 failed during FEX's high-address allocator setup; do not weaken the
+allocator to work around that emulator limitation. On a native ARM64 Linux runner,
+omit `--qemu`. On an ARM64 Android device, the test directory can instead be pushed
+with `adb` and the binary run with its directory in `LD_LIBRARY_PATH`.
+
+The test exercises integer/XMM arguments, host thunks, a nested guest callback,
+code invalidation and the production low-address allocator. QEMU execution,
+native ARM64 execution and the launcher emulator test are separate checks; none
+runs the original game or validates Vulkan rendering. CI runs the FEX test against
+the backend extracted from its own APK. Its Android 15 x86_64 emulator job builds
+with `-PlauncherTestAbi=x86_64` for launcher/diagnostic checks only; that APK does
+not contain the ARM64 game runtime.
+
+### Source bases
+
+The CPU adapter and assembly call bridge come from
+[seregasmith/ARM_linux_driveclub-recomp](https://github.com/seregasmith/ARM_linux_driveclub-recomp/tree/562f993c10b022aaf69be0271cd1c3cd287b040c)
+at `562f993c10b022aaf69be0271cd1c3cd287b040c`. FEX itself is pinned to
+`1c4f04b71a4d33091183fd7e1a2c09e6823d27fd`; `build-fex.sh` applies
+`cpu/fex-host-pages.patch` to that revision. The Bionic CMake integration and
+`getdents64` compatibility header come from
+[erickmendes22/gow3_android_daedalus_fork](https://github.com/erickmendes22/gow3_android_daedalus_fork/tree/b3a7c3d5e916cf8f4622192c0faa9383ebd77c00)
+at `b3a7c3d5e916cf8f4622192c0faa9383ebd77c00`; its dependency-build approach also
+informs the Android renderer build. The launcher layout and Gradle wrapper follow
 [ShadowOfTheColossus-Android-Aot](https://github.com/erickmendes22/ShadowOfTheColossus-Android-Aot).
-The staged CPU and presentation bring-up follows the
-[inFAMOUS Android plan](https://github.com/erickmendes22/iss_android/blob/main/docs/ANDROID_PORT.md).
-
-The mobile garage uses the desktop launcher's cover, wordmark and app icon.
-Biblioteca retains read-only access to the base and update directories through the
-Android document picker. It checks for game000.dat and reads sce_sys/param.sfo in
-place. Sistema shows the Vulkan device/driver API and live steering and pedal axes
-from a connected controller. CI saves screenshots from an Android 15 x86_64
-emulator separately from the ARM64 debug APK.
-
-### Embedded FEX on Android
-
-The Android target uses the Bionic ARM64 toolchain (NDK r29, API 30).
-Run `ANDROID_NDK_HOME=/path/to/ndk/29.0.14206865 android/tools/build-fex.sh`
-before assembling the ARM64 Gradle target. The CPU adapter and assembly call bridge
-come from seregasmith/ARM_linux_driveclub-recomp at
-562f993c10b022aaf69be0271cd1c3cd287b040c, including its FEX revision.
-The Bionic CMake integration and getdents64 compatibility header come from
-erickmendes22/gow3_android_daedalus_fork at b3a7c3d5e916cf8f4622192c0faa9383ebd77c00.

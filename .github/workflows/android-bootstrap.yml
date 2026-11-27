@@ -40,7 +40,7 @@ jobs:
       - name: Install native build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build pkg-config glslang-tools
+          sudo apt-get install -y ninja-build pkg-config
       - uses: actions/cache@v4
         with:
           path: |
@@ -51,10 +51,23 @@ jobs:
           key: android-bionic-r29-${{ hashFiles('android/tools/fetch-gpu-deps.sh', 'android/tools/build-fex.sh', 'cpu/**') }}
       - name: Cross-compile Driveclub loader and HLE for Bionic
         run: ANDROID_NDK_HOME="$ANDROID_HOME/ndk/29.0.14206865" android/tools/build-runtime-core.sh
-      - name: Build Driveclub CPU bridge for Android Bionic
-        run: ANDROID_NDK_HOME="$ANDROID_HOME/ndk/29.0.14206865" android/tools/build-fex.sh
-      - name: Build renderer dependencies for Android Bionic
-        run: ANDROID_NDK_HOME="$ANDROID_HOME/ndk/29.0.14206865" android/tools/fetch-gpu-deps.sh
+      - name: Build CPU and renderer dependencies for Android Bionic
+        run: |
+          export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/29.0.14206865"
+          export CMAKE_BUILD_PARALLEL_LEVEL=2
+          mkdir -p out/build-logs
+          android/tools/build-fex.sh >out/build-logs/fex.txt 2>&1 &
+          fex_build_pid=$!
+          android/tools/fetch-gpu-deps.sh >out/build-logs/gpu-dependencies.txt 2>&1 &
+          gpu_build_pid=$!
+          failed=0
+          wait "$fex_build_pid" || failed=1
+          wait "$gpu_build_pid" || failed=1
+          if [ "$failed" -ne 0 ]; then
+            tail -100 out/build-logs/fex.txt
+            tail -100 out/build-logs/gpu-dependencies.txt
+            exit 1
+          fi
       - run: ./gradlew assembleDebug
         working-directory: android
       - name: Verify packaged Bionic runtime and dependency closure
@@ -73,6 +86,11 @@ jobs:
         with:
           name: bionic-fex-test
           path: out/fex-test/
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: driveclub-native-build-logs
+          path: out/build-logs/
 
   launcher:
     runs-on: ubuntu-24.04
@@ -110,12 +128,23 @@ jobs:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 12
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           name: bionic-fex-test
           path: fex-test
+      - name: Prepare official Android 11 Bionic runtime
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y e2fsprogs
+          python3 android/tools/fetch-bionic-runtime.py --output out/android-bionic
       - name: Execute x86-64 instructions with the packaged ARM64 Bionic backend
         run: |
+          set -o pipefail
           chmod +x fex-test/test-fex
-          docker run --rm --network none -v "$PWD/fex-test:/test:ro" \
-              -e HOME=/tmp -e LD_LIBRARY_PATH=/test --entrypoint /test/test-fex termux/termux-docker:aarch64
+          python3 android/tools/run-bionic-test.py --runtime out/android-bionic fex-test/test-fex | tee fex-test/validation.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bionic-fex-validation
+          path: fex-test/validation.txt
