@@ -41,6 +41,12 @@ query_node() {
     python3 - "$1" "${2:-find}" <<'PY'
 import re, subprocess, sys, xml.etree.ElementTree as ET
 nodes = list(ET.parse('/tmp/launcher-window.xml').iter('node'))
+if any(n.get('resource-id') == 'android:id/immersive_cling_title' for n in nodes):
+    acknowledge = next(n for n in nodes if n.get('resource-id') == 'android:id/ok')
+    l,t,r,b = map(int, re.findall(r'\d+', acknowledge.get('bounds')))
+    subprocess.run(['adb','shell','input','tap',str((l+r)//2),str((t+b)//2)],check=True,timeout=30)
+    print('Dismissed the Android first-use full-screen tutorial.')
+    sys.exit(1)
 if any(n.get('text') == "Pixel Launcher isn't responding" for n in nodes):
     close = next(n for n in nodes if n.get('resource-id') == 'android:id/aerr_close')
     l,t,r,b = map(int, re.findall(r'\d+', close.get('bounds')))
