@@ -218,8 +218,9 @@ To record a new profile after the code has changed a lot: build with `BB_PGO=gen
 The Android 0.5 target integrates the local preparer, Driveclub loader/HLE, FEXCore,
 the existing shadPS4-based renderer, local FPKG installation, a bundled Turnip
 selector and analogue touch controls. It targets `arm64-v8a`, Android 11/API 30
-or later, using Bionic throughout. The new 0.5 Android integration tests are
-awaiting CI validation. Building the APK or passing synthetic tests does not
+or later, using Bionic throughout. The 0.5 APK audit, seven host PKG tests,
+six Android integration tests and five native ARM64/Bionic FEX checks passed.
+Building the APK or passing synthetic tests does not
 establish that the original game reaches its menu or gameplay; that requires an
 Android device run with the user's game files and its startup log.
 
@@ -264,6 +265,34 @@ The **Android Bionic FEX runtime** GitHub Actions workflow
 (`.github/workflows/android-bootstrap.yml`) can also be started with **Run workflow**.
 It builds and audits the APK and archives it as
 `driveclub-android-bionic-fex-arm64-debug`.
+
+### Signing APKs for updates
+
+GitHub Actions debug builds use a temporary runner's signing key. Distributed
+builds from 0.5 onward are re-signed with one retained private key so later APK
+updates can preserve the app's installed packages, saves and settings. Keep the
+private `Driveclub-Android-private-signing.zip` backup outside the repository and
+reuse that key; never publish its keystore or password in source or CI artifacts.
+Its public certificate SHA-256 is
+`46068ca7ce4ba21906c06b1b65cbf28ca0dcbbfd16406e67a83c66ecc943eb5b`.
+
+With the backup extracted in a private directory, use the SDK signing tool:
+
+    "$ANDROID_HOME/build-tools/35.0.0/apksigner" sign \
+      --ks /private/driveclub-android-release.p12 \
+      --ks-key-alias driveclub-android \
+      --ks-pass file:/private/store-password.txt \
+      --v4-signing-enabled false \
+      --out /output/Driveclub-Android-signed.apk /input/driveclub-android-debug.apk
+    "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs \
+      /output/Driveclub-Android-signed.apk
+    python3 android/tools/verify-apk.py /output/Driveclub-Android-signed.apk
+
+The previously distributed 0.4 APK used a different, unavailable debug key. It
+cannot be upgraded in place with this key: replacing that version requires a
+one-time uninstall, which removes its private app data. Export any needed logs
+first. Game folders selected outside the app's private storage are not removed
+by that uninstall. Subsequent distributed APKs must retain the new signing key.
 
 ### Local preparation and runtime
 
@@ -371,6 +400,16 @@ Vulkan probe alone does not prove that those renderer requirements are satisfied
 
 ### Verification
 
+The 0.5 validation records are the
+[ARM64 APK audit and native Bionic/FEX run](https://github.com/erickmendes22/driveclub-recomp-Arm64-Aot-/actions/runs/46082315169)
+and the [Android 15 integration, controls and log-export job](https://github.com/erickmendes22/driveclub-recomp-Arm64-Aot-/actions/runs/46083788175/job/140788571573).
+The delivered app was built at `bb85d0b4286207c3edc8efb4412dfaac1d75fadf`;
+subsequent changes for the successful emulator run affect only the smoke script
+and instrumentation diagnostics, not the app's code or assets. After private
+signing, the APK was audited again and its non-signature payload matched the CI
+APK. The delivered APK is 17,209,904 bytes, SHA-256
+`9edb86a8540365b1dde24f308e7aa8c57fa08394774c1e4c10539efbd479ccf2`.
+
 Run the host contract tests from the repository root without game files:
 
     mkdir -p out/android-tests
@@ -418,8 +457,9 @@ Run `--fixtures` first as above. The six instrumented tests comprise three real
 touch-stream/control tests and three JNI package/source tests: simultaneous
 steering and pedals, independent pointer release, focus/cancel/menu transitions,
 base/update publication, cancellation/corruption recovery, saves preservation and
-a unified folder with no separate update. These new 0.5 tests await their CI run;
-they do not execute the original game or validate device rendering. The workflow
+a unified folder with no separate update. All six passed on the Android 15
+emulator during 0.5 validation; they do not execute the original game or validate
+device rendering. The workflow
 also runs the launcher/log-export smoke checks through `android/smoke-launcher.sh`.
 
 Build the FEX ABI test against the backend extracted from the APK:
