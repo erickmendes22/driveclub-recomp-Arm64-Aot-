@@ -23,12 +23,6 @@ public final class ControlsPreviewActivity extends Activity {
         super.onCreate(state);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         getWindow().setDecorFitsSystemWindows(false);
-        WindowInsetsController bars = getWindow().getInsetsController();
-        if (bars != null) {
-            bars.hide(WindowInsets.Type.systemBars());
-            bars.setSystemBarsBehavior(WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
-        }
-
         FrameLayout root = new FrameLayout(this);
         root.setBackgroundColor(0xff10151d);
         ImageView backdrop = new ImageView(this);
@@ -77,6 +71,13 @@ public final class ControlsPreviewActivity extends Activity {
             return insets;
         });
         setContentView(root);
+        // PhoneWindow creates its DecorView during setContentView. Querying the
+        // insets controller before that throws on Android 15.
+        WindowInsetsController bars = getWindow().getInsetsController();
+        if (bars != null) {
+            bars.hide(WindowInsets.Type.systemBars());
+            bars.setSystemBarsBehavior(WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
+        }
     }
 
     /** Public view surface for the preview and Android MotionEvent integration tests. */

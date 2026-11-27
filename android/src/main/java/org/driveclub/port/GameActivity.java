@@ -43,11 +43,6 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
         log = new PortLog(this);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         getWindow().setDecorFitsSystemWindows(false);
-        WindowInsetsController bars = getWindow().getInsetsController();
-        if (bars != null) {
-            bars.hide(WindowInsets.Type.systemBars());
-            bars.setSystemBarsBehavior(WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
-        }
         FrameLayout root = new FrameLayout(this);
         root.setBackgroundColor(Color.BLACK);
         SurfaceView surface = new SurfaceView(this);
@@ -76,6 +71,11 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
             return insets;
         });
         setContentView(root);
+        WindowInsetsController bars = getWindow().getInsetsController();
+        if (bars != null) {
+            bars.hide(WindowInsets.Type.systemBars());
+            bars.setSystemBarsBehavior(WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
+        }
         try {
             if (!BuildConfig.GAME_RUNTIME) throw new UnsatisfiedLinkError("Runtime ARM64 ausente nesta compilação");
             System.loadLibrary("driveclub_game");

@@ -102,6 +102,11 @@ add_subdirectory(third_party/sirit EXCLUDE_FROM_ALL)
 # bbport: FSR 3.1 temporal upscaling / frame generation, native Vulkan (MIT, FireBurn/FSR-Vulkan).
 set(FFX_VK_PORTABLE_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(FFX_VK_PORTABLE_BUILD_PROBE OFF CACHE BOOL "" FORCE)
+if (ANDROID)
+    # The APK consumes FSR in this build tree; it does not install an FSR CMake
+    # SDK. Exporting FSR would incorrectly require exporting our app's loader.
+    set(FFX_VK_PORTABLE_INSTALL OFF CACHE BOOL "" FORCE)
+endif()
 add_subdirectory(third_party/fsr-vulkan EXCLUDE_FROM_ALL)
 
 # Host shaders -> headers (same scheme as shadPS4's host_shaders/CMakeLists.txt).
