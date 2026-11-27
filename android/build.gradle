@@ -34,3 +34,5 @@ def artwork = tasks.register('prepareLauncherArtwork', Sync) {
 }
 android.sourceSets.main.res.srcDir(layout.buildDirectory.dir('generated/launcherArt'))
 tasks.named('preBuild').configure { dependsOn artwork }
+
+android.sourceSets.main.assets.srcDir('../patches')

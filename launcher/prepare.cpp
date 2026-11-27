@@ -63,6 +63,8 @@ void WriteFile(const fs::path& path, const Bytes& data) {
   std::ofstream out(path, std::ios::binary | std::ios::trunc);
   if (!out) Fail("cannot write " + path.string());
   out.write(reinterpret_cast<const char*>(data.data()), std::streamsize(data.size()));
+  out.close();
+  if (!out) Fail("cannot finish writing " + path.string());
 }
 
 // ------------------------------------------------------------------------------------------

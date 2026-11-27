@@ -29,6 +29,8 @@ public final class PortActivity extends Activity {
             WHITE = 0xfffafafa, MUTED = 0xffc0c1ca;
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
     private GameLibrary library;
+    private String localStatus = "Execução do jogo em desenvolvimento.";
+    private TextView preparation;
     private PortLog log;
     private LinearLayout page, tabs, content;
     private TextView pad;
@@ -58,6 +60,7 @@ public final class PortActivity extends Activity {
         scroll.addView(page);
         setContentView(scroll);
         render();
+        prepareLocal(false);
         worker.execute(() -> {
             log.write("Vulkan", "Consultando dispositivos");
             String value = probeGraphics();
@@ -177,8 +180,37 @@ public final class PortActivity extends Activity {
         } else {
             folderCard("Jogo base", GameLibrary.BASE, BASE);
             folderCard("Atualização 1.28", GameLibrary.UPDATE, UPDATE);
-            content.addView(text("Execução do jogo em desenvolvimento.", 14, MUTED, false));
+            preparation = text(localStatus, 14, MUTED, false);
+            content.addView(preparation);
         }
+    }
+
+    private void prepareLocal(boolean refresh) {
+        Uri base = library.folder(GameLibrary.BASE);
+        Uri update = library.folder(GameLibrary.UPDATE);
+        if (base == null || update == null) return;
+        setPreparation("Verificando os arquivos locais…");
+        worker.execute(() -> {
+            try {
+                LocalGame.prepare(getApplicationContext(), library, base, update, refresh, log);
+                runOnUiThread(() -> {
+                    if (base.equals(library.folder(GameLibrary.BASE)) && update.equals(library.folder(GameLibrary.UPDATE)))
+                        setPreparation("Arquivos preparados neste aparelho. Execução em desenvolvimento.");
+                });
+            } catch (IOException | RuntimeException e) {
+                String message = e.getMessage();
+                log.write("Preparação local", message == null ? e.getClass().getSimpleName() : message);
+                runOnUiThread(() -> {
+                    if (base.equals(library.folder(GameLibrary.BASE)) && update.equals(library.folder(GameLibrary.UPDATE)))
+                        setPreparation("Falha na preparação local. Consulte os logs.");
+                });
+            }
+        });
+    }
+
+    private void setPreparation(String text) {
+        localStatus = text;
+        if (preparation != null) preparation.setText(text);
     }
 
     private void folderCard(String title, String key, int request) {
@@ -220,7 +252,10 @@ public final class PortActivity extends Activity {
         if (request == EXPORT_LOG) {
             worker.execute(() -> exportLog(uri));
         } else if (request == BASE || request == UPDATE) {
-            try { library.select(request == BASE ? GameLibrary.BASE : GameLibrary.UPDATE, uri); }
+            try {
+                library.select(request == BASE ? GameLibrary.BASE : GameLibrary.UPDATE, uri);
+                prepareLocal(true);
+            }
             catch (SecurityException e) { log.write("Pasta", "Permissão recusada"); Toast.makeText(this, "Falha ao obter acesso à pasta.", Toast.LENGTH_LONG).show(); }
             body();
         } else if (request == SFO) worker.execute(() -> {

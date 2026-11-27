@@ -51,3 +51,14 @@ Java_org_driveclub_port_PortActivity_inspect(JNIEnv* env, jclass, jbyteArray byt
     }
     return env->NewStringUTF(result);
 }
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_org_driveclub_port_LocalGame_prepareNative(JNIEnv* env, jclass, jstring path) {
+    const char* raw = env->GetStringUTFChars(path, nullptr);
+    if (!raw) return nullptr;
+    std::filesystem::path root(raw);
+    env->ReleaseStringUTFChars(path, raw);
+    const auto error = PrepareGame(root / "update", root / "base", root / "work",
+                                   root / "patches.xml", false, [](int, const std::string&) {});
+    return env->NewStringUTF(error.c_str());
+}

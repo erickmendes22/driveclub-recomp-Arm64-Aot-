@@ -5,6 +5,7 @@ on:
     paths:
       - 'android/**'
       - 'cpu/**'
+      - 'tests/test_android_fex.cpp'
       - 'launcher/prepare.*'
       - 'tests/test_update_metadata.cpp'
       - '.github/workflows/android-bootstrap.yml'
@@ -35,6 +36,15 @@ jobs:
           name: driveclub-android-arm64-debug
           path: android/build/outputs/apk/debug/*.apk
           if-no-files-found: error
+      - name: Extract the packaged FEX backend for the ARM64 execution test
+        run: |
+          mkdir -p out/fex-test
+          unzip -j android/build/outputs/apk/debug/*.apk 'lib/arm64-v8a/libbbcpu.so' 'lib/arm64-v8a/libc++_shared.so' -d out/fex-test
+          "$ANDROID_HOME/ndk/29.0.14206865/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android30-clang++" tests/test_android_fex.cpp -Lout/fex-test -lbbcpu -o out/fex-test/test-fex
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bionic-fex-test
+          path: out/fex-test/
       - name: Build emulator test APK
         run: ./gradlew assembleDebug -PlauncherTestAbi=x86_64
         working-directory: android
@@ -54,3 +64,18 @@ jobs:
         with:
           name: driveclub-launcher-preview
           path: out/launcher-preview/*.png
+
+  fex:
+    needs: apk
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 12
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: bionic-fex-test
+          path: fex-test
+      - name: Execute x86-64 instructions with the packaged ARM64 Bionic backend
+        run: |
+          chmod +x fex-test/test-fex
+          docker run --rm --network none -v "$PWD/fex-test:/test:ro" \
+              -e HOME=/tmp -e LD_LIBRARY_PATH=/test --entrypoint /test/test-fex termux/termux-docker:aarch64

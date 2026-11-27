@@ -39,7 +39,7 @@ final class GameLibrary {
         }
     }
 
-    private Uri child(Uri tree, String parent, String name, boolean directory) throws IOException {
+    Uri child(Uri tree, String parent, String name, boolean directory) throws IOException {
         Uri children = DocumentsContract.buildChildDocumentsUriUsingTree(tree, parent);
         String[] columns = {Document.COLUMN_DOCUMENT_ID, Document.COLUMN_DISPLAY_NAME, Document.COLUMN_MIME_TYPE};
         try (Cursor rows = context.getContentResolver().query(children, columns, null, null, null)) {
@@ -62,7 +62,8 @@ final class GameLibrary {
                 "game000.dat ausente na pasta selecionada." : "game000.dat encontrado.";
         Uri sys = child(tree, root, "sce_sys", true);
         Uri sfo = sys == null ? null : child(tree, DocumentsContract.getDocumentId(sys), "param.sfo", false);
-        if (sfo == null) return "sce_sys/param.sfo ausente na pasta selecionada.";
+        if (sfo == null) sfo = child(tree, root, "param.sfo", false);
+        if (sfo == null) return "param.sfo ausente na pasta selecionada.";
         return inspectFile(sfo);
     }
 
