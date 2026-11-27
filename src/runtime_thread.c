@@ -58,6 +58,15 @@ typedef struct GuestThread {
 
 static pthread_mutex_t lock=PTHREAD_MUTEX_INITIALIZER;
 static ThreadAttr *attributes;
+/* As in the GoW3 Bionic runtime, guest-visible thread pointers use the low arena. */
+static void *thread_alloc(size_t bytes) {
+#ifdef __ANDROID__
+    return runtime_low_map(bytes, PROT_READ | PROT_WRITE);
+#else
+    return calloc(1, bytes);
+#endif
+}
+
 static GuestThread *threads;
 static _Thread_local GuestThread *current;
 static _Thread_local int32_t guest_errno;
@@ -87,7 +96,11 @@ static void set_gs(void *base) {
 #else
 /* x86-64: arch_prctl(ARCH_SET_GS); other hosts: the guest CPU's GS base (runtime_cpu.c, cpu/). */
 static void set_gs(void *base) { guest_cpu_set_gs(base); }
+#ifdef __ANDROID__
+#define tls_block_alloc(size) thread_alloc(size)
+#else
 #define tls_block_alloc(size) aligned_alloc(64,size)
+#endif
 #endif
 /* Build TCB/static TLS for the calling host thread and point GS at it. */
 static void attach(GuestThread *t) {
@@ -107,7 +120,7 @@ static void attach(GuestThread *t) {
     current=t;
 }
 static GuestThread *new_thread(void) {
-    GuestThread *t=calloc(1,sizeof(*t));
+    GuestThread *t=thread_alloc(sizeof(*t));
     if (!t) return NULL;
     t->attr=(ThreadAttr){.magic=ATTR_MAGIC,.policy=1,.prio=DEFAULT_PRIO,.stack=DEFAULT_STACK,.affinity=0x7f};
     return t;
@@ -159,7 +172,7 @@ int32_t *runtime_errno(void) { return &guest_errno; }
 
 static ABI int32_t attr_init(ThreadAttr **out) {
     if (!out) return ERR(22);
-    ThreadAttr *a=calloc(1,sizeof(*a));
+    ThreadAttr *a=thread_alloc(sizeof(*a));
     if (!a) return ERR(12);
     *a=(ThreadAttr){.magic=ATTR_MAGIC,.policy=1,.prio=DEFAULT_PRIO,.inherit=4,.stack=DEFAULT_STACK,.guard=4096,.affinity=0x7f};
     pthread_mutex_lock(&lock); a->next=attributes; attributes=a; pthread_mutex_unlock(&lock);
@@ -173,7 +186,12 @@ static ABI int32_t attr_destroy(ThreadAttr **slot) {
     while (*link!=a) link=&(*link)->next;
     *link=a->next; a->magic=0;
     pthread_mutex_unlock(&lock);
-    free(a); *slot=NULL; return 0;
+#ifdef __ANDROID__
+    munmap(a, (sizeof(*a) + 16383) & ~(size_t)16383);
+#else
+    free(a);
+#endif
+    *slot=NULL; return 0;
 }
 static ABI int32_t attr_get(void *thread,ThreadAttr **out) {
     ThreadAttr *a=find_attr(out);

@@ -5,22 +5,12 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
-static void* map_low(size_t length, int prot) {
-    static uintptr_t hint = 0x0800000000;
-    void* address = mmap(reinterpret_cast<void*>(hint), length, prot, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    hint += (length + 65535) & ~uintptr_t(65535);
-    if (address == MAP_FAILED) return nullptr;
-    if (reinterpret_cast<uintptr_t>(address) + length > (uintptr_t(1) << 40)) {
-        munmap(address, length);
-        return nullptr;
-    }
-    return address;
-}
+extern "C" void* runtime_low_map(size_t length, int prot);
 
 int main() {
-    guest_cpu_init(map_low);
+    guest_cpu_init(runtime_low_map);
     auto page_size = static_cast<size_t>(sysconf(_SC_PAGESIZE));
-    auto* guest = static_cast<unsigned char*>(map_low(page_size, PROT_READ | PROT_WRITE));
+    auto* guest = static_cast<unsigned char*>(runtime_low_map(page_size, PROT_READ | PROT_WRITE));
     if (!guest) return 1;
     // movq rax,xmm0; add rax,rdi; ret (x86-64 System V).
     const unsigned char code[] = {0x66,0x48,0x0f,0x7e,0xc0,0x48,0x01,0xf8,0xc3};

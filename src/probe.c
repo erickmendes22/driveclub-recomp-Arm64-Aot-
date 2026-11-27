@@ -25,13 +25,34 @@
 #include <ucontext.h>
 #include <fcntl.h>
 #include <dlfcn.h>
+#ifdef __ANDROID__
+#include <unwind.h>
+#else
 #include <execinfo.h>
+#endif
 #include <sys/syscall.h>
 #include <sys/uio.h>
 #endif
 
 #ifdef _WIN32
 static unsigned long long start_tick; /* GetTickCount64() at start, for the fault report */
+#endif
+
+#if defined(__ANDROID__) && !defined(_WIN32)
+typedef struct { void **frames; int count, max; } UnwindState;
+static _Unwind_Reason_Code unwind_step(struct _Unwind_Context *context, void *argument) {
+    UnwindState *state = argument;
+    uintptr_t pc = _Unwind_GetIP(context);
+    if (!pc) return _URC_END_OF_STACK;
+    if (state->count >= state->max) return _URC_END_OF_STACK;
+    state->frames[state->count++] = (void *)pc;
+    return _URC_NO_REASON;
+}
+static int backtrace(void **frames, int max) {
+    UnwindState state = {frames, 0, max};
+    _Unwind_Backtrace(unwind_step, &state);
+    return state.count;
+}
 #endif
 
 typedef struct { uint64_t address, size, flags; } Segment;
@@ -1398,8 +1419,12 @@ int main(int argc, char **argv) {
 #ifndef _WIN32
     /* Keep host heap objects handed to the guest (thread handles, TLS) in the
        non-PIE brk heap, i.e. below 1 TiB: the guest packs pointers into 40 bits. */
+#ifdef __ANDROID__
+    mallopt(M_BIONIC_SET_HEAP_TAGGING_LEVEL, M_HEAP_TAGGING_LEVEL_NONE);
+#else
     mallopt(M_ARENA_MAX,1);
     mallopt(M_MMAP_THRESHOLD,32*1024*1024);
+#endif
     guest_cpu_init(runtime_low_map);
 #endif
     if (argc == 2 && !strcmp(argv[1], "--vulkan-only")) return vulkan_smoke();

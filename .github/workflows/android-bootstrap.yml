@@ -5,6 +5,7 @@ on:
     paths:
       - 'android/**'
       - 'cpu/**'
+      - 'src/**'
       - 'tests/test_android_fex.cpp'
       - 'launcher/prepare.*'
       - 'tests/test_update_metadata.cpp'
@@ -27,6 +28,8 @@ jobs:
       - uses: android-actions/setup-android@v3
         with:
           packages: 'platforms;android-35 build-tools;35.0.0 build-tools;34.0.0 ndk;29.0.14206865 cmake;3.22.1'
+      - name: Cross-compile Driveclub loader and HLE for Bionic
+        run: ANDROID_NDK_HOME="$ANDROID_HOME/ndk/29.0.14206865" android/tools/build-runtime-core.sh
       - name: Build Driveclub CPU bridge for Android Bionic
         run: ANDROID_NDK_HOME="$ANDROID_HOME/ndk/29.0.14206865" android/tools/build-fex.sh
       - run: ./gradlew assembleDebug
@@ -40,7 +43,7 @@ jobs:
         run: |
           mkdir -p out/fex-test
           unzip -j android/build/outputs/apk/debug/*.apk 'lib/arm64-v8a/libbbcpu.so' 'lib/arm64-v8a/libc++_shared.so' -d out/fex-test
-          "$ANDROID_HOME/ndk/29.0.14206865/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android30-clang++" tests/test_android_fex.cpp -Lout/fex-test -lbbcpu -o out/fex-test/test-fex
+          "$ANDROID_HOME/ndk/29.0.14206865/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android30-clang++" tests/test_android_fex.cpp out/android-runtime/libdriveclub-runtime.a -Wl,--gc-sections -Lout/fex-test -lbbcpu -o out/fex-test/test-fex
       - uses: actions/upload-artifact@v4
         with:
           name: bionic-fex-test
