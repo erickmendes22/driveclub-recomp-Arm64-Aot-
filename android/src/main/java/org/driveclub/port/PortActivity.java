@@ -20,15 +20,16 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ExecutorService;
 
 public final class PortActivity extends Activity {
-    static { System.loadLibrary("driveclub_android"); }
+
     private static native String probeGraphics();
     static native String inspect(byte[] sfo);
 
-    private static final int SFO = 1, BASE = 2, UPDATE = 3;
+    private static final int SFO = 1, BASE = 2, UPDATE = 3, EXPORT_LOG = 4;
     private static final int BG = 0xff101116, PANEL = 0xff202128, RED = 0xffff394e,
             WHITE = 0xfffafafa, MUTED = 0xffc0c1ca;
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
     private GameLibrary library;
+    private PortLog log;
     private LinearLayout page, tabs, content;
     private TextView pad;
     private boolean system;
@@ -37,6 +38,10 @@ public final class PortActivity extends Activity {
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
+        log = new PortLog(this);
+        log.session(this);
+        log.write("JNI", "Carregando biblioteca nativa");
+        System.loadLibrary("driveclub_android");
         library = new GameLibrary(this);
         system = state != null && state.getBoolean("system");
         ScrollView scroll = new ScrollView(this);
@@ -54,7 +59,9 @@ public final class PortActivity extends Activity {
         setContentView(scroll);
         render();
         worker.execute(() -> {
+            log.write("Vulkan", "Consultando dispositivos");
             String value = probeGraphics();
+            log.write("Vulkan", value);
             runOnUiThread(() -> { gpu = value; if (system && !isDestroyed()) body(); });
         });
     }
@@ -157,6 +164,11 @@ public final class PortActivity extends Activity {
             device.addView(text(Build.MANUFACTURER + " " + Build.MODEL + "  ·  Android " + Build.VERSION.RELEASE, 15, MUTED, false));
             LinearLayout graphics = card("Processador gráfico");
             graphics.addView(text(gpu, 16, WHITE, false));
+            LinearLayout logs = card("Diagnóstico");
+            action(logs, "Ver logs", this::showLog);
+            action(logs, "Exportar logs", () -> startActivityForResult(new Intent(Intent.ACTION_CREATE_DOCUMENT)
+                    .addCategory(Intent.CATEGORY_OPENABLE).setType("text/plain")
+                    .putExtra(Intent.EXTRA_TITLE, "driveclub-diagnostico.txt"), EXPORT_LOG));
             LinearLayout controls = card("Teste de controle");
             pad = text(controller, 16, MUTED, false);
             controls.addView(pad);
@@ -182,7 +194,8 @@ public final class PortActivity extends Activity {
         if (selected) worker.execute(() -> {
             String message;
             try { message = library.summary(key); }
-            catch (IOException | RuntimeException e) { message = "Pasta inacessível. Selecione novamente."; }
+            catch (IOException | RuntimeException e) { message = "Pasta inacessível. Selecione novamente. (" + e.getClass().getSimpleName() + ")"; }
+            log.write(key, message);
             String status = message;
             runOnUiThread(() -> result.setText(status));
         });
@@ -204,20 +217,57 @@ public final class PortActivity extends Activity {
         super.onActivityResult(request, code, data);
         if (code != RESULT_OK || data == null || data.getData() == null) return;
         Uri uri = data.getData();
-        if (request == BASE || request == UPDATE) {
+        if (request == EXPORT_LOG) {
+            worker.execute(() -> exportLog(uri));
+        } else if (request == BASE || request == UPDATE) {
             try { library.select(request == BASE ? GameLibrary.BASE : GameLibrary.UPDATE, uri); }
-            catch (SecurityException e) { Toast.makeText(this, "Falha ao obter acesso à pasta.", Toast.LENGTH_LONG).show(); }
+            catch (SecurityException e) { log.write("Pasta", "Permissão recusada"); Toast.makeText(this, "Falha ao obter acesso à pasta.", Toast.LENGTH_LONG).show(); }
             body();
         } else if (request == SFO) worker.execute(() -> {
             String status;
             try { status = library.inspectFile(uri); }
             catch (IOException | RuntimeException e) { status = "Falha ao ler o SFO (limite de 64 KiB)."; }
+            log.write("SFO", status);
             String result = status;
             runOnUiThread(() -> {
                 if (!isFinishing() && !isDestroyed()) new AlertDialog.Builder(this).setTitle("param.sfo")
                         .setMessage(result).setPositiveButton("Fechar", null).show();
             });
         });
+    }
+
+    private void showLog() {
+        worker.execute(() -> {
+            String message;
+            try {
+                String history = new String(log.snapshot(), java.nio.charset.StandardCharsets.UTF_8);
+                int cut = history.length() - 12000;
+                message = cut > 0 ? history.substring(history.indexOf('\n', cut) + 1) : history;
+            } catch (IOException e) { message = "Falha ao ler os logs."; }
+            String visible = message;
+            runOnUiThread(() -> {
+                if (isFinishing() || isDestroyed()) return;
+                new AlertDialog.Builder(this).setTitle("Logs recentes").setMessage(visible)
+                        .setPositiveButton("Fechar", null).show();
+            });
+        });
+    }
+
+    private void exportLog(Uri uri) {
+        String result;
+        try {
+            byte[] data = log.snapshot();
+            try (java.io.OutputStream out = getContentResolver().openOutputStream(uri, "wt")) {
+                if (out == null) throw new IOException();
+                out.write(data);
+            }
+            result = "Logs exportados.";
+        } catch (IOException | RuntimeException e) {
+            result = "Falha ao exportar os logs (" + e.getClass().getSimpleName() + ").";
+        }
+        log.write("Exportação", result);
+        String notice = result;
+        runOnUiThread(() -> Toast.makeText(this, notice, Toast.LENGTH_LONG).show());
     }
 
     @Override protected void onSaveInstanceState(Bundle state) {

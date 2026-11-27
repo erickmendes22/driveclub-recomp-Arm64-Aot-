@@ -12,7 +12,7 @@ node() {
     python3 - "$1" "${2:-find}" <<'PY'
 import re, subprocess, sys, xml.etree.ElementTree as ET
 for n in ET.parse('/tmp/launcher-window.xml').iter('node'):
-    if sys.argv[1] in (n.get('text'), n.get('content-desc')):
+    if sys.argv[1].casefold() in [n.get(k, '').casefold() for k in ('text', 'content-desc', 'resource-id')]:
         if sys.argv[2] == 'tap':
             l,t,r,b = map(int, re.findall(r'\d+', n.get('bounds')))
             subprocess.run(['adb','shell','input','tap',str((l+r)//2),str((t+b)//2)],check=True)
@@ -36,3 +36,17 @@ adb shell input keyevent BACK
 node 'Sistema' tap
 node 'Processador gráfico'
 adb exec-out screencap -p > out/launcher-preview/sistema.png
+node 'Ver logs' tap
+node 'Logs recentes'
+node 'Fechar' tap
+node 'Exportar logs' tap
+node 'Save' tap
+for attempt in 1 2 3 4 5; do
+    exported=$(adb shell find /sdcard/ -name driveclub-diagnostico.txt | tr -d '\r' | head -1)
+    if [ -n "$exported" ]; then break; fi
+    sleep 1
+done
+test -n "$exported"
+adb shell cat "$exported" > /tmp/driveclub-export.txt
+grep -F '[Sessão]' /tmp/driveclub-export.txt
+grep -F '[Vulkan]' /tmp/driveclub-export.txt
