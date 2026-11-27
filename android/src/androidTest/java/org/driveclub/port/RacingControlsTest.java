@@ -4,6 +4,7 @@ import android.content.Intent;
 import android.graphics.Rect;
 import android.os.SystemClock;
 import android.test.InstrumentationTestCase;
+import android.util.Log;
 import android.view.InputDevice;
 import android.view.MotionEvent;
 import android.view.accessibility.AccessibilityNodeInfo;
@@ -20,30 +21,45 @@ public final class RacingControlsTest extends InstrumentationTestCase {
     private long downTime;
 
     @Override protected void setUp() throws Exception {
+        phase("setUp: begin");
         super.setUp();
         Intent intent = new Intent(getInstrumentation().getTargetContext(), ControlsPreviewActivity.class);
         intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        phase("setUp: before startActivitySync");
         activity = (ControlsPreviewActivity) getInstrumentation().startActivitySync(intent);
+        phase("setUp: after startActivitySync");
+        phase("setUp: before waitForIdleSync");
         getInstrumentation().waitForIdleSync();
+        phase("setUp: after waitForIdleSync");
+        phase("setUp: before runOnMainSync");
         getInstrumentation().runOnMainSync(() -> {
+            phase("setUp: entered main thread");
             controls = activity.getControls();
             controls.setListener(output::set);
         });
+        phase("setUp: after runOnMainSync");
         assertTrue("The real controls must be laid out", controls.getWidth() > 0 && controls.getHeight() > 0);
         neutral();
+        phase("setUp: complete");
     }
 
     @Override protected void tearDown() throws Exception {
+        phase("tearDown: begin");
         try {
+            phase("tearDown: before runOnMainSync");
             if (activity != null) getInstrumentation().runOnMainSync(() -> {
                 if (controls != null) controls.releaseAll();
                 activity.finish();
             });
+            phase("tearDown: after runOnMainSync");
+            phase("tearDown: before waitForIdleSync");
             getInstrumentation().waitForIdleSync();
-        } finally { super.tearDown(); }
+            phase("tearDown: after waitForIdleSync");
+        } finally { super.tearDown(); phase("tearDown: complete"); }
     }
 
     public void testSteeringGasBrakeAndIndependentPointerRelease() {
+        phase("test: begin");
         Rect steering = bounds("Direção analógica"), gas = bounds("Acelerar (R2)"), brake = bounds("Frear (L2)");
         Finger wheel = finger(7, steering), throttle = finger(19, gas), braking = finger(23, brake);
         send(MotionEvent.ACTION_DOWN, wheel);
@@ -87,9 +103,11 @@ public final class RacingControlsTest extends InstrumentationTestCase {
         assertEquals(0f, output.get().l2, .001f);
         send(MotionEvent.ACTION_UP, wheel);
         neutral();
+        phase("test: complete");
     }
 
     public void testCancelAndFocusLossReleaseEveryControl() {
+        phase("test: begin");
         Finger wheel = finger(3, bounds("Direção analógica"));
         Finger gas = finger(11, bounds("Acelerar (R2)"));
         Finger brake = finger(25, bounds("Frear (L2)"));
@@ -107,9 +125,11 @@ public final class RacingControlsTest extends InstrumentationTestCase {
         send(MotionEvent.ACTION_MOVE, gas);
         neutral();
         send(MotionEvent.ACTION_UP, gas);
+        phase("test: complete");
     }
 
     public void testMenuSwitchReleasesHeldInputsAndRoutesMenuButtons() {
+        phase("test: begin");
         Finger gas = finger(5, bounds("Acelerar (R2)"));
         Finger wheel = finger(9, bounds("Direção analógica"));
         Finger mode = finger(16, bounds("Mostrar botões de menu"));
@@ -145,7 +165,10 @@ public final class RacingControlsTest extends InstrumentationTestCase {
         clickButton("Freio de mão (Círculo)", 0x2000);
         clickButton("Trocar câmera (R1)", 0x800);
         clickButton("Pausar (Options)", 0x8);
+        phase("test: complete");
     }
+
+    private void phase(String phase) { Log.i("DriveclubControlsTest", getName() + " | " + phase); }
 
     private void clickButton(String description, int mask) {
         Finger finger = finger(12, bounds(description));
