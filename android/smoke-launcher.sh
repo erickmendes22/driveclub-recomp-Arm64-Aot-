@@ -6,7 +6,7 @@ adb shell wm size 1080x2160
 adb shell wm density 420
 adb shell am start -W -n org.driveclub.port/.PortActivity
 # Read accessibility labels and tap their bounds independently of screen density.
-node() {
+query_node() {
     adb shell uiautomator dump /sdcard/launcher-window.xml >/dev/null
     adb pull /sdcard/launcher-window.xml /tmp/launcher-window.xml >/dev/null
     python3 - "$1" "${2:-find}" <<'PY'
@@ -20,6 +20,14 @@ for n in ET.parse('/tmp/launcher-window.xml').iter('node'):
 else:
     sys.exit('Missing UI element: ' + sys.argv[1])
 PY
+}
+node() {
+    for attempt in 1 2 3 4 5; do
+        if query_node "$@"; then return 0; fi
+        sleep 1
+    done
+    cat /tmp/launcher-window.xml
+    return 1
 }
 node 'Atualização 1.28'
 adb exec-out screencap -p > out/launcher-preview/biblioteca.png
