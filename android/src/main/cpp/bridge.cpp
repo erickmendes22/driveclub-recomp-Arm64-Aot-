@@ -1,5 +1,11 @@
 #include "prepare.h"
 #include <jni.h>
+#if defined(__aarch64__)
+#include "guest_cpu.h"
+// Take a strong reference to the backend, so the Android linker resolves the
+// Driveclub call ABI (including floating-point arguments) when loading JNI.
+extern "C" decltype(&guest_cpu_call_xmm) const driveclub_fex_call_xmm = guest_cpu_call_xmm;
+#endif
 #include <vulkan/vulkan.h>
 #include <string>
 

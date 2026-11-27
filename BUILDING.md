@@ -241,3 +241,13 @@ Android document picker. It checks for game000.dat and reads sce_sys/param.sfo i
 place. Sistema shows the Vulkan device/driver API and live steering and pedal axes
 from a connected controller. CI saves screenshots from an Android 15 x86_64
 emulator separately from the ARM64 debug APK.
+
+### Embedded FEX on Android
+
+The Android target uses the Bionic ARM64 toolchain (NDK r29, API 30).
+Run `ANDROID_NDK_HOME=/path/to/ndk/29.0.14206865 android/tools/build-fex.sh`
+before assembling the ARM64 Gradle target. The CPU adapter and assembly call bridge
+come from seregasmith/ARM_linux_driveclub-recomp at
+562f993c10b022aaf69be0271cd1c3cd287b040c, including its FEX revision.
+The Bionic CMake integration and getdents64 compatibility header come from
+erickmendes22/gow3_android_daedalus_fork at b3a7c3d5e916cf8f4622192c0faa9383ebd77c00.

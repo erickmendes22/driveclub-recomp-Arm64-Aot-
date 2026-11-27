@@ -5,3 +5,11 @@ target_compile_features(driveclub_android PRIVATE cxx_std_20)
 target_include_directories(driveclub_android PRIVATE ../launcher)
 target_link_libraries(driveclub_android PRIVATE vulkan)
 target_link_options(driveclub_android PRIVATE "-Wl,-z,max-page-size=16384")
+
+if(ANDROID_ABI STREQUAL "arm64-v8a")
+    add_library(bbcpu SHARED IMPORTED)
+    set_target_properties(bbcpu PROPERTIES IMPORTED_LOCATION
+        "${CMAKE_CURRENT_SOURCE_DIR}/../out/android-fex/build/libbbcpu.so")
+    target_include_directories(driveclub_android PRIVATE ../src)
+    target_link_libraries(driveclub_android PRIVATE bbcpu)
+endif()

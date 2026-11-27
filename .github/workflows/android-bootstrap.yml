@@ -4,6 +4,7 @@ on:
   push:
     paths:
       - 'android/**'
+      - 'cpu/**'
       - 'launcher/prepare.*'
       - 'tests/test_update_metadata.cpp'
       - '.github/workflows/android-bootstrap.yml'
@@ -24,7 +25,9 @@ jobs:
           java-version: '17'
       - uses: android-actions/setup-android@v3
         with:
-          packages: 'platforms;android-35 build-tools;35.0.0 build-tools;34.0.0 ndk;27.2.12479018 cmake;3.22.1'
+          packages: 'platforms;android-35 build-tools;35.0.0 build-tools;34.0.0 ndk;29.0.14206865 cmake;3.22.1'
+      - name: Build Driveclub CPU bridge for Android Bionic
+        run: ANDROID_NDK_HOME="$ANDROID_HOME/ndk/29.0.14206865" android/tools/build-fex.sh
       - run: ./gradlew assembleDebug
         working-directory: android
       - uses: actions/upload-artifact@v4
