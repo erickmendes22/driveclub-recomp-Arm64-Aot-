@@ -1,22 +1,36 @@
 package org.driveclub.port;
 
+import android.app.Activity;
+import android.app.Application;
+import android.app.Instrumentation.ActivityMonitor;
 import android.content.Intent;
 import android.graphics.Rect;
+import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.os.SystemClock;
 import android.test.InstrumentationTestCase;
 import android.util.Log;
 import android.view.InputDevice;
 import android.view.MotionEvent;
+import android.view.View;
 import android.view.accessibility.AccessibilityNodeInfo;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.FutureTask;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 /** Exercises the same View and public input callback used by GameActivity. */
 public final class RacingControlsTest extends InstrumentationTestCase {
+    private static final long UI_TIMEOUT_MS = 10000;
+    private final Handler ui = new Handler(Looper.getMainLooper());
     private ControlsPreviewActivity activity;
     private RacingControls controls;
+    private View.OnLayoutChangeListener layoutListener;
     private final AtomicReference<RacingControls.State> output = new AtomicReference<>();
     private long downTime;
 
@@ -25,37 +39,107 @@ public final class RacingControlsTest extends InstrumentationTestCase {
         super.setUp();
         Intent intent = new Intent(getInstrumentation().getTargetContext(), ControlsPreviewActivity.class);
         intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-        phase("setUp: before startActivitySync");
-        activity = (ControlsPreviewActivity) getInstrumentation().startActivitySync(intent);
-        phase("setUp: after startActivitySync");
-        phase("setUp: before waitForIdleSync");
-        getInstrumentation().waitForIdleSync();
-        phase("setUp: after waitForIdleSync");
-        phase("setUp: before runOnMainSync");
-        getInstrumentation().runOnMainSync(() -> {
-            phase("setUp: entered main thread");
-            controls = activity.getControls();
-            controls.setListener(output::set);
-        });
-        phase("setUp: after runOnMainSync");
-        assertTrue("The real controls must be laid out", controls.getWidth() > 0 && controls.getHeight() > 0);
-        neutral();
-        phase("setUp: complete");
+        ActivityMonitor monitor = getInstrumentation().addMonitor(ControlsPreviewActivity.class.getName(), null, false);
+        try {
+            // startActivitySync also waits for queue idleness and can wait forever
+            // after a failed setup. Creation and actual layout are separate events.
+            phase("setUp: awaiting activity (10-second deadline)");
+            getInstrumentation().getTargetContext().startActivity(intent);
+            activity = (ControlsPreviewActivity) monitor.waitForActivityWithTimeout(UI_TIMEOUT_MS);
+            assertNotNull("The controls activity must start within 10 seconds", activity);
+            phase("setUp: activity created; awaiting real layout (10-second deadline)");
+            awaitControlsLayout();
+            neutral();
+            phase("setUp: complete");
+        } catch (Exception | Error failure) {
+            // JUnit3 does not call tearDown when setUp fails. Do not leave this
+            // activity and its surface alive for the next test's launch.
+            if (activity == null && monitor.getLastActivity() instanceof ControlsPreviewActivity)
+                activity = (ControlsPreviewActivity) monitor.getLastActivity();
+            try { closePreview(); }
+            catch (Exception | Error cleanup) { failure.addSuppressed(cleanup); }
+            throw failure;
+        } finally { getInstrumentation().removeMonitor(monitor); }
     }
 
     @Override protected void tearDown() throws Exception {
         phase("tearDown: begin");
+        try { closePreview(); }
+        finally { super.tearDown(); phase("tearDown: complete"); }
+    }
+
+    private void awaitControlsLayout() throws Exception {
+        CountDownLatch laidOut = new CountDownLatch(1);
+        layoutListener = (view, left, top, right, bottom, oldLeft, oldTop, oldRight, oldBottom) -> {
+            if (right > left && bottom > top) laidOut.countDown();
+        };
+        onUi(() -> {
+            controls = activity.getControls();
+            assertNotNull("The activity must expose the real controls", controls);
+            controls.setListener(output::set);
+            controls.addOnLayoutChangeListener(layoutListener);
+            // Register before checking, so a layout between these steps is never lost.
+            if (controls.isLaidOut() && controls.getWidth() > 0 && controls.getHeight() > 0)
+                laidOut.countDown();
+        });
+        assertTrue("The real controls must receive a non-empty layout within 10 seconds",
+                   laidOut.await(UI_TIMEOUT_MS, TimeUnit.MILLISECONDS));
+        onUi(() -> {
+            controls.removeOnLayoutChangeListener(layoutListener);
+            layoutListener = null;
+            assertTrue("The real controls must be laid out", controls.getWidth() > 0 && controls.getHeight() > 0);
+        });
+    }
+
+    private void onUi(Runnable action) throws Exception {
+        FutureTask<Void> task = new FutureTask<>(action, null);
+        assertTrue("The UI thread must accept the test operation", ui.post(task));
+        try { task.get(UI_TIMEOUT_MS, TimeUnit.MILLISECONDS); }
+        catch (ExecutionException failure) {
+            if (failure.getCause() instanceof Error) throw (Error) failure.getCause();
+            throw failure;
+        } finally {
+            task.cancel(false);
+            ui.removeCallbacks(task);
+        }
+    }
+
+    private void closePreview() throws Exception {
+        if (activity == null) return;
+        ControlsPreviewActivity closing = activity;
+        RacingControls closingControls = controls;
+        View.OnLayoutChangeListener pendingLayout = layoutListener;
+        CountDownLatch destroyed = new CountDownLatch(1);
+        Application.ActivityLifecycleCallbacks lifecycle = new Application.ActivityLifecycleCallbacks() {
+            @Override public void onActivityDestroyed(Activity value) { if (value == closing) destroyed.countDown(); }
+            @Override public void onActivityCreated(Activity value, Bundle state) {}
+            @Override public void onActivityStarted(Activity value) {}
+            @Override public void onActivityResumed(Activity value) {}
+            @Override public void onActivityPaused(Activity value) {}
+            @Override public void onActivityStopped(Activity value) {}
+            @Override public void onActivitySaveInstanceState(Activity value, Bundle state) {}
+        };
+        Application application = closing.getApplication();
+        application.registerActivityLifecycleCallbacks(lifecycle);
         try {
-            phase("tearDown: before runOnMainSync");
-            if (activity != null) getInstrumentation().runOnMainSync(() -> {
-                if (controls != null) controls.releaseAll();
-                activity.finish();
+            phase("cleanup: requesting finish; awaiting destruction (10-second deadline)");
+            onUi(() -> {
+                if (closingControls != null) {
+                    if (pendingLayout != null) closingControls.removeOnLayoutChangeListener(pendingLayout);
+                    closingControls.releaseAll();
+                }
+                if (closing.isDestroyed()) destroyed.countDown();
+                else closing.finish();
             });
-            phase("tearDown: after runOnMainSync");
-            phase("tearDown: before waitForIdleSync");
-            getInstrumentation().waitForIdleSync();
-            phase("tearDown: after waitForIdleSync");
-        } finally { super.tearDown(); phase("tearDown: complete"); }
+            assertTrue("The controls activity must be destroyed within 10 seconds",
+                       destroyed.await(UI_TIMEOUT_MS, TimeUnit.MILLISECONDS));
+            phase("cleanup: activity destroyed");
+        } finally {
+            application.unregisterActivityLifecycleCallbacks(lifecycle);
+            activity = null;
+            controls = null;
+            layoutListener = null;
+        }
     }
 
     public void testSteeringGasBrakeAndIndependentPointerRelease() {
