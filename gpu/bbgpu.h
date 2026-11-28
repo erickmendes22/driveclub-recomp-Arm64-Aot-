@@ -6,6 +6,13 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
+#ifdef __ANDROID__
+struct ANativeWindow;
+/* Called before bbgpu_init. Takes its own reference to the borrowed Activity
+ * surface. Clear only when ending the isolated runtime process/session. */
+void bbgpu_android_set_window(struct ANativeWindow* window);
+void bbgpu_android_set_refresh_rate(float hz);
+#endif
 typedef struct {
     const char *title;          /* window title */
     const char *serial;         /* CUSA id, names the pipeline cache */
@@ -15,7 +22,11 @@ typedef struct {
     int32_t width, height;      /* initial window size */
     int32_t render_height;      /* the game's 3D render height after patches and upscaling, 0 unknown */
 } BbGpuConfig;
-/* Registers kernel event queues (needed with or without graphics). */
+/* Registers all GPU, media, event-queue and network import symbols exactly once.
+ * Does not create devices, windows or service threads; safe for import preflight. */
+void bbgpu_register_libraries(void);
+/* Registers media/event/network imports and starts kernel/network services.
+ * Does not register GnmDriver/VideoOut, so CPU-only runs retain their traps. */
 void bbgpu_register_kernel(void);
 /* Co-op: the game folder and param.sfo identity for the network and PSN libraries. */
 void bbnet_configure(const char *app0, const char *serial, const char *title, const char *app_ver);

@@ -15,9 +15,8 @@
 
 #ifdef __unix__
 #include "common/adaptive_mutex.h"
-#else
-#include "common/spin_lock.h"
 #endif
+#include "common/spin_lock.h"
 #include "common/debug.h"
 #include "common/types.h"
 #include "video_core/buffer_cache/region_definitions.h"

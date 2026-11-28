@@ -364,12 +364,14 @@ s32 PS4_SYSV_ABI sceNpAuthDeleteRequest(s32 req_id) {
     return ORBIS_OK;
 }
 
-void RegisterLib(Core::Loader::SymbolsResolver* sym) {
+void Initialize() {
     // BB_NP_LOCAL: the local account is signed in, so authorization codes are handed out. A server that
     // does not check them against shadNet accepts any code.
     const char* local_account = std::getenv("BB_NP_LOCAL");
     g_shadnet_enabled = EmulatorSettings.IsShadNetEnabled() || (local_account && *local_account);
+}
 
+void RegisterLib(Core::Loader::SymbolsResolver* sym) {
     LIB_FUNCTION("6bwFkosYRQg", "libSceNpAuth", 1, "libSceNpAuth", sceNpAuthCreateRequest);
     LIB_FUNCTION("N+mr7GjTvr8", "libSceNpAuth", 1, "libSceNpAuth", sceNpAuthCreateAsyncRequest);
     LIB_FUNCTION("KxGkOrQJTqY", "libSceNpAuth", 1, "libSceNpAuth", sceNpAuthGetAuthorizationCode);

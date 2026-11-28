@@ -1,17 +1,20 @@
 /* System services for an offline, single-user console:
  *   - one local user (id 1) who is logged in but not signed in to PSN;
  *   - network cable unplugged: NetCtl disconnected, sockets unavailable;
- *   - common dialogs complete immediately (no UI is drawn yet);
+ *   - choices requiring unavailable dialog UI report explicit cancellation;
+ *     progress notifications stay running until the caller closes them;
  *   - the whole package is installed (PlayGo reports every chunk local).
  * Every entry here is an explicit contract; unknown functions still stop. */
 #define _GNU_SOURCE
 #include "runtime.h"
+#include "runtime_dialogs.h"
 #include "gpu/bbgpu.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
 #include <time.h>
+#include <math.h>
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -38,7 +41,6 @@ typedef int SOCKET; /* the Winsock names the co-op poll below uses */
 #define NET_ENETUNREACH ((int32_t)0x80410133)
 #define NET_EINVAL ((int32_t)0x80410116)
 #define HTTP_NETWORK ((int32_t)0x80431063)
-#define DIALOG_NOT_INITIALIZED ((int32_t)0x80B80003)
 #define PLAYGO_BAD_HANDLE ((int32_t)0x80B20009)
 #define PLAYGO_BAD_POINTER ((int32_t)0x80B2000A)
 #define PLAYGO_BAD_SIZE ((int32_t)0x80B2000B)
@@ -404,6 +406,30 @@ static ABI int32_t system_event(void *event) {
     printf("SystemService: event %#x delivered (caller %p)\n",*(uint32_t*)event,__builtin_return_address(0));
     return 0;
 }
+/* These control the console's separate background music player, not the game's
+ * AudioOut ports or Android media belonging to other apps. This provider has no
+ * such player, so only its allow/deny policy changes; no playback is fabricated. */
+static int system_music_allowed=1;
+static int32_t system_music_policy(int allowed) {
+    pthread_mutex_lock(&lock);
+    int changed=system_music_allowed!=allowed;
+    system_music_allowed=allowed;
+    pthread_mutex_unlock(&lock);
+    if (changed) printf("Runtime: console background music %s (no background player)\n",allowed ? "allowed" : "disabled");
+    return 0;
+}
+static ABI int32_t system_music_disable(void) { return system_music_policy(0); }
+static ABI int32_t system_music_reenable(void) { return system_music_policy(1); }
+static ABI int32_t system_power_tick(void) {
+    /* The Android game window holds FLAG_KEEP_SCREEN_ON for its visible
+     * lifetime. A console inactivity tick requires no additional wake lock. */
+    static int noted;
+    pthread_mutex_lock(&lock);
+    int first=!noted; noted=1;
+    pthread_mutex_unlock(&lock);
+    if (first) note("SystemServicePowerTick: inactivity policy is owned by the game window");
+    return 0;
+}
 static ABI int32_t hide_splash(void) { note("SystemService: splash screen hidden"); return 0; }
 static ABI int32_t launch_browser(void) { note("SystemService: web browser request ignored (offline)"); return 0; }
 
@@ -478,44 +504,376 @@ static ABI int32_t np_compare(const void *a,const void *b) {
     return memcmp(a,b,16) ? (int32_t)0x80550609 : 0; /* NP_UTIL NOT_MATCH */
 }
 
-/* ---- Voice chat: ports exist, carry no audio ---- */
-static ABI int32_t voice_port(void *param,uint32_t *port) { (void)param; if (!port) return (int32_t)0x8029000b; *port=(uint32_t)new_id(); return 0; }
-static ABI int32_t voice_read(uint32_t port,void *data,uint32_t *size) { (void)port; (void)data; if (size) *size=0; return 0; }
-static ABI int32_t voice_write(uint32_t port,const void *data,uint32_t *size) { (void)port; (void)data; (void)size; return 0; }
-static ABI int32_t voice_info(uint32_t port,uint32_t *info) {
-    (void)port;
-    if (!info) return (int32_t)0x8029000b;
-    memset(info,0,40); /* type, state=unconnected, no bytes available */
-    return 0;
+/* ---- Voice chat: logical ports, no capture/codec device backend ------------- */
+#define VOICE_NOT_INIT ((int32_t)0x804E0801)
+#define VOICE_ALREADY_INIT ((int32_t)0x804E0802)
+#define VOICE_PORT_INVALID ((int32_t)0x804E0804)
+#define VOICE_ARGUMENT_INVALID ((int32_t)0x804E0805)
+#define VOICE_TOPOLOGY ((int32_t)0x804E0807)
+#define VOICE_RESOURCE_INSUFFICIENT ((int32_t)0x804E0808)
+typedef struct { int32_t type; uint16_t threshold, mute; float volume; uint32_t data[3]; } VoicePortParam;
+typedef struct {
+    int32_t type,state;
+    uint32_t *edges;
+    uint32_t bytes,frame_size;
+    uint16_t edge_count,reserved;
+    uint32_t pad;
+} VoicePortInfo;
+_Static_assert(sizeof(VoicePortParam)==24 && sizeof(VoicePortInfo)==32,"voice port ABI");
+static pthread_mutex_t voice_lock=PTHREAD_MUTEX_INITIALIZER;
+static int voice_initialized,voice_running;
+static struct { int used,type; float volume; } voice_ports[64];
+static int32_t voice_check(uint32_t port) {
+    return !voice_initialized ? VOICE_NOT_INIT :
+        port>=64 || !voice_ports[port].used ? VOICE_PORT_INVALID : 0;
+}
+static ABI int32_t voice_init(const void *param,int32_t container) {
+    (void)container;
+    pthread_mutex_lock(&voice_lock);
+    int32_t result=voice_initialized ? VOICE_ALREADY_INIT : !param ? VOICE_ARGUMENT_INVALID : 0;
+    if (!result) { memset(voice_ports,0,sizeof(voice_ports)); voice_initialized=1; voice_running=0; }
+    pthread_mutex_unlock(&voice_lock);
+    return result;
+}
+static ABI int32_t voice_end(void) {
+    pthread_mutex_lock(&voice_lock);
+    int32_t result=voice_initialized ? 0 : VOICE_NOT_INIT;
+    if (!result) { memset(voice_ports,0,sizeof(voice_ports)); voice_initialized=voice_running=0; }
+    pthread_mutex_unlock(&voice_lock);
+    return result;
+}
+/* The output pointer is argument 1, as in the real CUSA00093 call at 0x46d2dd.
+ * Swapping these arguments corrupts the first word of the caller's parameter. */
+static ABI int32_t voice_port(int32_t *out,const VoicePortParam *param) {
+    pthread_mutex_lock(&voice_lock);
+    int32_t result=!voice_initialized ? VOICE_NOT_INIT :
+        !out || !param || param->type<0 || param->type>5 ? VOICE_ARGUMENT_INVALID : 0;
+    /* Device-type ports are logical endpoints too. Allocating one does not
+     * open a microphone or claim a device is connected; its state stays idle. */
+    if (!result) {
+        unsigned i=0;
+        while (i<64 && voice_ports[i].used) ++i;
+        if (i==64) result=VOICE_RESOURCE_INSUFFICIENT;
+        else {
+            voice_ports[i].used=1; voice_ports[i].type=param->type;
+            voice_ports[i].volume=isfinite(param->volume) ? param->volume : 0.0f;
+            *out=(int32_t)i;
+        }
+    }
+    pthread_mutex_unlock(&voice_lock);
+    return result;
+}
+static ABI int32_t voice_delete(uint32_t port) {
+    pthread_mutex_lock(&voice_lock);
+    int32_t result=voice_check(port);
+    if (!result) memset(&voice_ports[port],0,sizeof(voice_ports[port]));
+    pthread_mutex_unlock(&voice_lock);
+    return result;
+}
+static ABI int32_t voice_info(uint32_t port,VoicePortInfo *info) {
+    pthread_mutex_lock(&voice_lock);
+    int32_t result=voice_check(port);
+    if (!result && !info) result=VOICE_ARGUMENT_INVALID;
+    if (!result) *info=(VoicePortInfo){.type=voice_ports[port].type,.edges=info->edges,.frame_size=1};
+    pthread_mutex_unlock(&voice_lock);
+    return result;
+}
+static ABI int32_t voice_volume(uint32_t port,float volume) {
+    pthread_mutex_lock(&voice_lock);
+    int32_t result=voice_check(port);
+    if (!result) voice_ports[port].volume=isfinite(volume) ? volume : 0.0f;
+    pthread_mutex_unlock(&voice_lock);
+    return result;
+}
+static ABI int32_t voice_get_volume(uint32_t port,float *volume) {
+    pthread_mutex_lock(&voice_lock);
+    int32_t result=voice_check(port);
+    if (!result && !volume) result=VOICE_ARGUMENT_INVALID;
+    if (!result) *volume=voice_ports[port].volume;
+    pthread_mutex_unlock(&voice_lock);
+    return result;
+}
+static ABI int32_t voice_connect(uint32_t input,uint32_t output) {
+    pthread_mutex_lock(&voice_lock);
+    int32_t result=voice_check(input);
+    if (!result) result=voice_check(output);
+    pthread_mutex_unlock(&voice_lock);
+    /* No encoder/device route exists; never report a working audio connection. */
+    return result ? result : VOICE_TOPOLOGY;
+}
+static ABI int32_t voice_disconnect(uint32_t input,uint32_t output) {
+    pthread_mutex_lock(&voice_lock);
+    int32_t result=voice_check(input);
+    if (!result) result=voice_check(output);
+    pthread_mutex_unlock(&voice_lock);
+    return result; /* there are no routes to retain */
+}
+static ABI int32_t voice_start(const void *const *param) {
+    pthread_mutex_lock(&voice_lock);
+    int32_t result=!voice_initialized ? VOICE_NOT_INIT : !param || !*param ? VOICE_ARGUMENT_INVALID : 0;
+    if (!result) voice_running=1; /* logical service only; no capture backend */
+    pthread_mutex_unlock(&voice_lock);
+    return result;
+}
+static ABI int32_t voice_stop(void) {
+    pthread_mutex_lock(&voice_lock);
+    int32_t result=voice_initialized ? 0 : VOICE_NOT_INIT;
+    if (!result) voice_running=0;
+    pthread_mutex_unlock(&voice_lock);
+    return result;
+}
+static ABI int32_t voice_read(uint32_t port,void *data,uint32_t *size) {
+    pthread_mutex_lock(&voice_lock);
+    int32_t result=voice_check(port);
+    if (!result && (!data || !size)) result=VOICE_ARGUMENT_INVALID;
+    if (!result && voice_ports[port].type!=3 && voice_ports[port].type!=4) result=VOICE_TOPOLOGY;
+    if (!result) *size=0; /* no received voice frames, caller's audio buffer untouched */
+    pthread_mutex_unlock(&voice_lock);
+    return result;
+}
+static ABI int32_t voice_write(uint32_t port,const void *data,uint32_t *size,int16_t unused) {
+    (void)unused;
+    pthread_mutex_lock(&voice_lock);
+    int32_t result=voice_check(port);
+    if (!result && (!data || !size)) result=VOICE_ARGUMENT_INVALID;
+    if (!result) { *size=0; result=VOICE_TOPOLOGY; } /* no route; bytes were not consumed */
+    pthread_mutex_unlock(&voice_lock);
+    return result;
 }
 
-/* ---- Common dialogs: nothing is displayed; an opened dialog finishes. ---- */
-typedef struct { const char *name; int initialized, status; } Dialog;
-static Dialog dialogs[]={{"CommonDialog",0,0},{"MsgDialog",0,0},{"SaveDataDialog",0,0},
-                         {"NpProfileDialog",0,0},{"NpCommerceDialog",0,0},{"ImeDialog",0,0}};
-static int common_initialized __attribute__((unused));
-static ABI int32_t common_init(void) { common_initialized=1; return 0; }
+/* ---- Common dialogs -------------------------------------------------------
+ * There is currently no platform UI for these choices. Requests still have a
+ * real lifecycle and result, but no affirmative button or selected save is
+ * invented. Passive/progress dialogs are notifications of work performed by
+ * the game; they remain RUNNING until Close/Terminate, even at 100 percent. */
+_Static_assert(sizeof(DialogBase)==48 && sizeof(MessageDialogParam)==136,"message dialog ABI");
+_Static_assert(sizeof(MessageDialogResult)==44,"message result ABI");
+_Static_assert(sizeof(SaveDialogParam)==152 && sizeof(SaveDialogResult)==72,"save dialog ABI");
+_Static_assert(sizeof(ProfileDialogParam)==128 && sizeof(ProfileDialogResult)==48,"profile dialog ABI");
+_Static_assert(sizeof(CommerceDialogParam)==128 && sizeof(CommerceDialogResult)==48,"commerce dialog ABI");
+enum { MSG_DIALOG, SAVE_DIALOG, PROFILE_DIALOG, COMMERCE_DIALOG };
+typedef struct {
+    const char *name;
+    int status, passive, result;
+    uint32_t mode, progress;
+    void *user_data;
+} Dialog;
+static Dialog dialogs[]={
+    {.name="MsgDialog"}, {.name="SaveDataDialog"},
+    {.name="NpProfileDialog"}, {.name="NpCommerceDialog"}
+};
+static pthread_mutex_t dialog_lock=PTHREAD_MUTEX_INITIALIZER;
+static int common_initialized, dialog_owner=-1;
+static ABI int32_t common_init(void) {
+    pthread_mutex_lock(&dialog_lock);
+    int32_t result=common_initialized ? DIALOG_ALREADY_SYSTEM_INITIALIZED : 0;
+    common_initialized=1;
+    pthread_mutex_unlock(&dialog_lock);
+    return result;
+}
+static ABI int32_t common_is_used(void) {
+    pthread_mutex_lock(&dialog_lock);
+    int used=dialog_owner>=0;
+    pthread_mutex_unlock(&dialog_lock);
+    return used;
+}
 static int32_t dialog_init(int i) {
-    if (dialogs[i].initialized) return (int32_t)0x80B80004;
-    dialogs[i].initialized=1; dialogs[i].status=1; return 0;
+    pthread_mutex_lock(&dialog_lock);
+    int32_t result=!common_initialized ? DIALOG_NOT_SYSTEM_INITIALIZED :
+        dialogs[i].status!=DIALOG_NONE ? DIALOG_ALREADY_INITIALIZED :
+        dialog_owner>=0 ? DIALOG_BUSY : 0;
+    if (!result) { dialogs[i].status=DIALOG_INITIALIZED; dialog_owner=i; }
+    pthread_mutex_unlock(&dialog_lock);
+    return result;
 }
-static int32_t dialog_open(int i) {
-    if (!dialogs[i].initialized) return DIALOG_NOT_INITIALIZED;
-    printf("Runtime: %s opened; completed immediately (no dialog UI yet)\n",dialogs[i].name);
-    dialogs[i].status=3; return 0;
+static int32_t dialog_can_open(int i,const void *param) {
+    if (dialogs[i].status!=DIALOG_INITIALIZED && dialogs[i].status!=DIALOG_FINISHED)
+        return DIALOG_INVALID_STATE;
+    return param ? 0 : DIALOG_ARG_NULL;
 }
-static int32_t dialog_status(int i) { return dialogs[i].status; }
+static void dialog_begin(int i,uint32_t mode,int passive,void *user_data) {
+    Dialog *d=&dialogs[i];
+    d->mode=mode; d->passive=passive; d->progress=0; d->user_data=user_data;
+    d->result=DIALOG_RESULT_CANCELED;
+    d->status=DIALOG_RUNNING;
+    printf("Runtime: %s mode %u: %s\n",d->name,mode,passive ?
+        "progress notification; waiting for caller Close (no dialog UI)" :
+        "dialog UI unavailable; returning cancellation, no selection");
+}
+static int32_t dialog_status(int i,int update) {
+    pthread_mutex_lock(&dialog_lock);
+    Dialog *d=&dialogs[i];
+    if (update && d->status==DIALOG_RUNNING && !d->passive) d->status=DIALOG_FINISHED;
+    int status=d->status;
+    pthread_mutex_unlock(&dialog_lock);
+    return status;
+}
+static int32_t dialog_close(int i) {
+    pthread_mutex_lock(&dialog_lock);
+    Dialog *d=&dialogs[i];
+    int32_t result=d->status==DIALOG_RUNNING ? 0 : DIALOG_NOT_RUNNING;
+    if (!result) {
+        /* A caller closes its own progress notification after doing the work.
+         * No affirmative button or save selection is associated with it. */
+        d->result=d->passive ? DIALOG_RESULT_OK : DIALOG_RESULT_CANCELED;
+        d->status=DIALOG_FINISHED;
+    }
+    pthread_mutex_unlock(&dialog_lock);
+    return result;
+}
 static int32_t dialog_term(int i) {
-    if (!dialogs[i].initialized) return DIALOG_NOT_INITIALIZED;
-    dialogs[i].initialized=0; dialogs[i].status=0; return 0;
+    pthread_mutex_lock(&dialog_lock);
+    int32_t result=dialogs[i].status==DIALOG_NONE ? DIALOG_NOT_INITIALIZED : 0;
+    if (!result) {
+        const char *name=dialogs[i].name;
+        dialogs[i]=(Dialog){.name=name};
+        if (dialog_owner==i) dialog_owner=-1;
+    }
+    pthread_mutex_unlock(&dialog_lock);
+    return result;
 }
-#define DIALOG(tag,i) \
+#define DIALOG_LIFECYCLE(tag,i) \
     static ABI int32_t tag##_init(void) { return dialog_init(i); } \
-    static ABI int32_t tag##_open(const void *p) { (void)p; return dialog_open(i); } \
-    static ABI int32_t tag##_status(void) { return dialog_status(i); } \
+    static ABI int32_t tag##_status(void) { return dialog_status(i,1); } \
+    static ABI int32_t tag##_get_status(void) { return dialog_status(i,0); } \
+    static ABI int32_t tag##_close(void) { return dialog_close(i); } \
     static ABI int32_t tag##_term(void) { return dialog_term(i); }
-DIALOG(msg,1) DIALOG(save,2) DIALOG(profile,3) DIALOG(commerce,4)
-static ABI int32_t profile_result(void *result) { if (result) memset(result,0,4); return 0; }
+DIALOG_LIFECYCLE(msg,MSG_DIALOG)
+DIALOG_LIFECYCLE(save,SAVE_DIALOG)
+DIALOG_LIFECYCLE(profile,PROFILE_DIALOG)
+DIALOG_LIFECYCLE(commerce,COMMERCE_DIALOG)
+static int dialog_base_valid(const DialogBase *base) { return base->size==sizeof(*base); }
+static ABI int32_t msg_open(const MessageDialogParam *p) {
+    pthread_mutex_lock(&dialog_lock);
+    int32_t result=dialog_can_open(MSG_DIALOG,p);
+    int passive=0;
+    if (!result) {
+        if (!dialog_base_valid(&p->base) || p->size!=sizeof(*p) || p->mode<1 || p->mode>3)
+            result=DIALOG_PARAM_INVALID;
+        else if (p->mode==1) {
+            /* Legacy button type 4 is used by Driveclub 1.28 at 0x663d3b,
+             * although it is absent from some newer reference headers. */
+            if (!p->user || !p->user->message || p->user->button_type>9 ||
+                (p->user->button_type==9 && !p->user->buttons)) result=DIALOG_PARAM_INVALID;
+            else passive=p->user->button_type==2 || p->user->button_type==5 || p->user->button_type==6;
+        } else if (p->mode==2) {
+            if (!p->progress || p->progress->type>1) result=DIALOG_PARAM_INVALID;
+            else passive=1;
+        } else if (!p->system) result=DIALOG_PARAM_INVALID;
+        if (!result) dialog_begin(MSG_DIALOG,p->mode,passive,NULL);
+    }
+    pthread_mutex_unlock(&dialog_lock);
+    return result;
+}
+static ABI int32_t save_open(const SaveDialogParam *p) {
+    pthread_mutex_lock(&dialog_lock);
+    int32_t result=dialog_can_open(SAVE_DIALOG,p);
+    int passive=0;
+    if (!result) {
+        if (!dialog_base_valid(&p->base) || p->size!=(int32_t)sizeof(*p) || p->mode<1 || p->mode>5 ||
+            p->display_type<1 || p->display_type>3 || !p->items) result=DIALOG_PARAM_INVALID;
+        else if (p->mode==2) {
+            if (!p->user || !p->user->message || p->user->button_type>3 || p->user->message_type>1)
+                result=DIALOG_PARAM_INVALID;
+            else passive=p->user->button_type==2;
+        } else if (p->mode==3) {
+            if (!p->system) result=DIALOG_PARAM_INVALID;
+            else passive=p->system->type==5; /* operation-in-progress notice */
+        } else if (p->mode==4 && !p->error) result=DIALOG_PARAM_INVALID;
+        else if (p->mode==5) {
+            if (!p->progress || p->progress->type || p->progress->system_type>2)
+                result=DIALOG_PARAM_INVALID;
+            else passive=1;
+        }
+        if (!result) dialog_begin(SAVE_DIALOG,p->mode,passive,p->user_data);
+    }
+    pthread_mutex_unlock(&dialog_lock);
+    return result;
+}
+static ABI int32_t profile_open(const ProfileDialogParam *p) {
+    pthread_mutex_lock(&dialog_lock);
+    int32_t result=dialog_can_open(PROFILE_DIALOG,p);
+    if (!result) {
+        if (!dialog_base_valid(&p->base) || p->size!=sizeof(*p) || p->mode<1 || p->mode>4)
+            result=DIALOG_PARAM_INVALID;
+        else dialog_begin(PROFILE_DIALOG,p->mode,0,p->user_data);
+    }
+    pthread_mutex_unlock(&dialog_lock);
+    return result;
+}
+static ABI int32_t commerce_open(const CommerceDialogParam *p) {
+    pthread_mutex_lock(&dialog_lock);
+    int32_t result=dialog_can_open(COMMERCE_DIALOG,p);
+    if (!result) {
+        if (!dialog_base_valid(&p->base) || p->size!=(int32_t)sizeof(*p) || p->mode<0 || p->mode>5 ||
+            p->service_label>7 || p->target_count>10 || (p->target_count && !p->targets))
+            result=DIALOG_PARAM_INVALID;
+        else dialog_begin(COMMERCE_DIALOG,(uint32_t)p->mode,0,p->user_data);
+    }
+    pthread_mutex_unlock(&dialog_lock);
+    return result;
+}
+static ABI int32_t commerce_result(CommerceDialogResult *out) {
+    pthread_mutex_lock(&dialog_lock);
+    int32_t result=!out ? DIALOG_ARG_NULL : dialogs[COMMERCE_DIALOG].status!=DIALOG_FINISHED ? DIALOG_NOT_FINISHED : 0;
+    if (!result) {
+        *out=(CommerceDialogResult){.result=DIALOG_RESULT_CANCELED,.authorized=0,
+            .user_data=dialogs[COMMERCE_DIALOG].user_data};
+        result=DIALOG_RESULT_CANCELED; /* Commerce GetResult returns this code too. */
+    }
+    pthread_mutex_unlock(&dialog_lock);
+    return result;
+}
+static ABI int32_t msg_result(MessageDialogResult *out) {
+    pthread_mutex_lock(&dialog_lock);
+    int32_t result=dialogs[MSG_DIALOG].status!=DIALOG_FINISHED ? DIALOG_NOT_FINISHED :
+        !out ? DIALOG_ARG_NULL : 0;
+    if (!result) *out=(MessageDialogResult){.result=(uint32_t)dialogs[MSG_DIALOG].result};
+    pthread_mutex_unlock(&dialog_lock);
+    return result;
+}
+static ABI int32_t save_result(SaveDialogResult *out) {
+    pthread_mutex_lock(&dialog_lock);
+    const Dialog *d=&dialogs[SAVE_DIALOG];
+    int32_t result=d->status!=DIALOG_FINISHED ? DIALOG_NOT_FINISHED : !out ? DIALOG_ARG_NULL : 0;
+    if (!result) {
+        /* dirName and param are caller-owned output buffers. No chosen item
+         * exists for cancellation/progress, so neither buffer is modified. */
+        *out=(SaveDialogResult){.mode=d->mode,.result=(uint32_t)d->result,
+            .dir_name=out->dir_name,.param=out->param,.user_data=d->user_data};
+    }
+    pthread_mutex_unlock(&dialog_lock);
+    return result;
+}
+static ABI int32_t profile_result(ProfileDialogResult *out) {
+    pthread_mutex_lock(&dialog_lock);
+    int32_t result=dialogs[PROFILE_DIALOG].status!=DIALOG_FINISHED ? DIALOG_NOT_FINISHED :
+        !out ? DIALOG_ARG_NULL : 0;
+    if (!result) *out=(ProfileDialogResult){.result=NP_SIGNED_OUT,.user_action=DIALOG_RESULT_CANCELED,
+        .user_data=dialogs[PROFILE_DIALOG].user_data};
+    pthread_mutex_unlock(&dialog_lock);
+    return result;
+}
+static ABI int32_t save_ready(void) {
+    pthread_mutex_lock(&dialog_lock);
+    int ready=dialogs[SAVE_DIALOG].status!=DIALOG_NONE && dialog_owner==SAVE_DIALOG;
+    pthread_mutex_unlock(&dialog_lock);
+    return ready;
+}
+static int32_t dialog_progress(int i,uint32_t target,uint32_t value,int increment) {
+    pthread_mutex_lock(&dialog_lock);
+    Dialog *d=&dialogs[i];
+    int32_t result=d->status!=DIALOG_RUNNING ? DIALOG_NOT_RUNNING :
+        d->mode!=(i==MSG_DIALOG ? 2u : 5u) ? DIALOG_NOT_SUPPORTED :
+        target || value>100 || (increment && value>100-d->progress) ? DIALOG_PARAM_INVALID : 0;
+    if (!result) d->progress=increment ? d->progress+value : value;
+    pthread_mutex_unlock(&dialog_lock);
+    return result;
+}
+static ABI int32_t msg_progress(uint32_t target,uint32_t value) { return dialog_progress(MSG_DIALOG,target,value,0); }
+static ABI int32_t msg_progress_inc(uint32_t target,uint32_t value) { return dialog_progress(MSG_DIALOG,target,value,1); }
+static ABI int32_t save_progress(uint32_t target,uint32_t value) { return dialog_progress(SAVE_DIALOG,target,value,0); }
+static ABI int32_t save_progress_inc(uint32_t target,uint32_t value) { return dialog_progress(SAVE_DIALOG,target,value,1); }
 /* ImeDialog: text typed on the keyboard into the game window (title bar shows it).
  * OrbisImeDialogParam: user, type, languages(8), enter label, method, filter,
  * option, max length, char16 buffer, position, alignment, placeholder, title. */
@@ -570,7 +928,7 @@ static ABI int32_t ime_init(const ImeParam *param, const void *extended) {
      * can accept it (the port has no on-screen keyboard). */
     const char *name=getenv("BB_USER_NAME");
     const char *start=initial[0] ? initial : name && *name ? name : "Player";
-    if (!bbgpu_text_input_begin(start,prompt[0] ? prompt : "Text")) ime_complete(0,start);
+    if (!bbgpu_text_input_begin(start,prompt[0] ? prompt : "Text")) ime_complete(1,initial);
     else printf("Runtime: ImeDialog opened: shown on screen; keyboard Enter or Cross accepts, Esc or Circle cancels\n");
     return 0;
 }
@@ -712,6 +1070,11 @@ static ABI int32_t mouse_read(int32_t handle,unsigned char *data,int32_t count) 
 }
 static ABI int32_t mouse_close(int32_t handle) { (void)handle; return 0; }
 static ABI int32_t audio_in_open(void) { return AUDIO_IN_NOT_OPENED; }
+static ABI int32_t audio_in_silent(int32_t handle) {
+    if (((uint32_t)handle&0x7f000000)!=0x30000000 || ((uint32_t)handle&0xff)>=7)
+        return (int32_t)0x80260101; /* INVALID_HANDLE */
+    return AUDIO_IN_NOT_OPENED; /* no microphone was opened by this provider */
+}
 
 
 static const RuntimeExport exports[]={
@@ -719,6 +1082,9 @@ static const RuntimeExport exports[]={
     {"sceUserServiceGetInitialUser",user_initial}, {"sceUserServiceGetLoginUserIdList",user_list},
     {"sceUserServiceGetUserName",user_name}, {"sceUserServiceGetEvent",user_event},
     {"sceSystemServiceParamGetInt",system_param}, {"sceSystemServiceGetStatus",system_status},
+    {"sceSystemServiceDisableMusicPlayer",system_music_disable},
+    {"sceSystemServiceReenableMusicPlayer",system_music_reenable},
+    {"sceSystemServicePowerTick",system_power_tick},
     {"sceSystemServiceReceiveEvent",system_event}, {"sceSystemServiceHideSplashScreen",hide_splash},
     {"sceSystemServiceLaunchWebBrowser",launch_browser},
     {"sceNetInit",net_init}, {"sceNetTerm",net_term}, {"sceNetErrnoLoc",net_errno_loc},
@@ -798,25 +1164,36 @@ static const RuntimeExport exports[]={
     {"sceNpScoreGetRankingByNpIdPcId",np_signed_out}, {"sceNpScoreGetRankingByRange",np_signed_out},
     {"sceNpScoreRecordGameData",np_signed_out}, {"sceNpScoreRecordScore",np_signed_out},
     {"sceNpScoreSetPlayerCharacterId",ok_void},
-    {"sceVoiceCreatePort",voice_port}, {"sceVoiceDeletePort",ok_void},
-    {"sceVoiceConnectIPortToOPort",ok_void}, {"sceVoiceDisconnectIPortFromOPort",ok_void},
-    {"sceVoiceStart",ok_void}, {"sceVoiceStop",ok_void}, {"sceVoiceGetPortInfo",voice_info},
+    {"sceVoiceCreatePort",voice_port}, {"sceVoiceDeletePort",voice_delete},
+    {"sceVoiceConnectIPortToOPort",voice_connect}, {"sceVoiceDisconnectIPortFromOPort",voice_disconnect},
+    {"sceVoiceStart",voice_start}, {"sceVoiceStop",voice_stop}, {"sceVoiceGetPortInfo",voice_info},
+    {"sceVoiceSetVolume",voice_volume}, {"sceVoiceGetVolume",voice_get_volume},
     {"sceVoiceReadFromOPort",voice_read}, {"sceVoiceWriteToIPort",voice_write},
     {"sceAudioInInput",audio_in_open}, {"sceAudioInClose",audio_in_open},
+    {"sceAudioInGetSilentState",audio_in_silent},
     {"sceNpMatching2Initialize",ok_void}, {"sceNpMatching2Terminate",ok_void},
     {"sceNpMatching2CreateContext",np_signed_out},
     {"sceNpSignalingInitialize",ok_void}, {"sceNpSignalingTerminate",ok_void},
     {"sceNpSignalingCreateContext",np_signed_out},
-    {"sceCommonDialogInitialize",common_init},
+    {"sceCommonDialogInitialize",common_init}, {"sceCommonDialogIsUsed",common_is_used},
     {"sceMsgDialogInitialize",msg_init}, {"sceMsgDialogOpen",msg_open},
     {"sceMsgDialogUpdateStatus",msg_status}, {"sceMsgDialogTerminate",msg_term},
+    {"sceMsgDialogGetStatus",msg_get_status}, {"sceMsgDialogClose",msg_close},
+    {"sceMsgDialogGetResult",msg_result}, {"sceMsgDialogProgressBarSetValue",msg_progress},
+    {"sceMsgDialogProgressBarInc",msg_progress_inc},
     {"sceSaveDataDialogInitialize",save_init}, {"sceSaveDataDialogOpen",save_open},
     {"sceSaveDataDialogUpdateStatus",save_status}, {"sceSaveDataDialogTerminate",save_term},
+    {"sceSaveDataDialogGetStatus",save_get_status}, {"sceSaveDataDialogClose",save_close},
+    {"sceSaveDataDialogGetResult",save_result}, {"sceSaveDataDialogIsReadyToDisplay",save_ready},
+    {"sceSaveDataDialogProgressBarSetValue",save_progress}, {"sceSaveDataDialogProgressBarInc",save_progress_inc},
     {"sceNpProfileDialogInitialize",profile_init}, {"sceNpProfileDialogOpen",profile_open},
     {"sceNpProfileDialogUpdateStatus",profile_status}, {"sceNpProfileDialogTerminate",profile_term},
-    {"sceNpProfileDialogGetResult",profile_result},
+    {"sceNpProfileDialogGetResult",profile_result}, {"sceNpProfileDialogGetStatus",profile_get_status},
+    {"sceNpProfileDialogClose",profile_close},
     {"sceNpCommerceDialogInitialize",commerce_init}, {"sceNpCommerceDialogOpen",commerce_open},
     {"sceNpCommerceDialogUpdateStatus",commerce_status}, {"sceNpCommerceDialogTerminate",commerce_term},
+    {"sceNpCommerceDialogGetStatus",commerce_get_status}, {"sceNpCommerceDialogClose",commerce_close},
+    {"sceNpCommerceDialogGetResult",commerce_result},
     {"sceImeDialogInit",ime_init}, {"sceImeDialogGetStatus",ime_status}, {"sceImeDialogGetResult",ime_result},
     {"sceImeDialogTerm",ime_term}, {"sceImeDialogAbort",ime_term},
     {"sceNpTrophyCreateContext",trophy_context}, {"sceNpTrophyCreateHandle",trophy_handle},
@@ -835,7 +1212,7 @@ static const RuntimeExport exports[]={
     {"sceMouseInit",ok_void}, {"sceMouseOpen",mouse_open}, {"sceMouseRead",mouse_read}, {"sceMouseClose",mouse_close},
     {"sceAudioInOpen",audio_in_open},
     {"sceDiscMapIsRequestOnHDD",discmap_on_hdd}, {"sceDiscMap_8A828CAEE7EDD5E9",discmap_8a82},
-    {"sceVoiceInit",ok_void}, {"sceVoiceEnd",ok_void},
+    {"sceVoiceInit",voice_init}, {"sceVoiceEnd",voice_end},
 };
 /* Co-op (BB_ONLINE=1): network and PSN calls go to the shadNet libraries in bbgpu when they
  * implement them. Trophies, voice and the store/profile dialogs stay here. */
@@ -850,6 +1227,9 @@ static int online_symbol(const char *symbol) {
     return match;
 }
 uintptr_t runtime_services_resolve(const char *name) {
+    /* GetVolume is a documented companion of SetVolume, not imported by this
+     * eboot; keep its canonical NID available without altering the inventory. */
+    if (nid_match(name,"jjkCjneOYSs")) return (uintptr_t)voice_get_volume;
     static int online=-1;
     if (online<0) { const char *v=getenv("BB_ONLINE"); online=v && v[0]=='1'; }
     if (online) {

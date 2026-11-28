@@ -4,12 +4,16 @@
 #include "guest_cpu.h"
 #if defined(GUEST_CPU_NATIVE)
 #include "runtime.h"
+#include "guest_setcontext_code.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
 #include <x86intrin.h>
+#include <pthread.h>
 #ifndef _WIN32
 #include <unistd.h>
+#include <sys/mman.h>
 #include <ucontext.h>
 #include <sys/syscall.h>
 #include <asm/prctl.h>
@@ -18,7 +22,40 @@
 void guest_cpu_init(void *(*map)(size_t size, int prot)) { (void)map; }
 void guest_cpu_code(uintptr_t base, size_t size) { (void)base; (void)size; }
 void guest_cpu_code_changed(uintptr_t address, size_t size) { (void)address; (void)size; }
-uintptr_t guest_cpu_host_function(void *fn) { return (uintptr_t)fn; }
+static ABI __attribute__((noreturn)) void invalid_libunwind_context(const void *context,uint64_t reason) {
+    fprintf(stderr,"STOP: invalid __Ux86_64_setcontext at %p (reason %llu: 1 pointer/alignment, 2 mc_len, 3 RIP/RSP, 4 FP owner, 5 FP format)\n",
+            context,(unsigned long long)reason);
+    fflush(stderr);
+    _exit(21);
+}
+int guest_cpu_libunwind_setcontext(const void *context) {
+    invalid_libunwind_context(context,0); /* Must be bound through guest_cpu_host_function. */
+}
+static pthread_once_t restore_once=PTHREAD_ONCE_INIT;
+static uintptr_t restore_entry;
+static void create_restore_entry(void) {
+    unsigned char *code=runtime_low_map(sizeof(guest_setcontext_code),PROT_READ|PROT_WRITE);
+    if (!code) { fputs("STOP: cannot allocate libunwind restore entry\n",stderr); _exit(21); }
+    memcpy(code,guest_setcontext_code,sizeof(guest_setcontext_code));
+    uintptr_t failure=(uintptr_t)invalid_libunwind_context;
+    memcpy(code+GUEST_SETCONTEXT_FAILURE_OFFSET,&failure,sizeof(failure));
+#ifdef _WIN32
+    DWORD old;
+    if (!VirtualProtect(code,sizeof(guest_setcontext_code),PAGE_EXECUTE_READ,&old)) {
+#else
+    if (mprotect(code,(sizeof(guest_setcontext_code)+16383)&~(size_t)16383,PROT_READ|PROT_EXEC)) {
+#endif
+        fputs("STOP: cannot protect libunwind restore entry\n",stderr); _exit(21);
+    }
+    restore_entry=(uintptr_t)code;
+}
+uintptr_t guest_cpu_host_function(void *fn) {
+    if (fn==(void *)guest_cpu_libunwind_setcontext) {
+        pthread_once(&restore_once,create_restore_entry);
+        return restore_entry;
+    }
+    return (uintptr_t)fn;
+}
 uint64_t guest_cpu_call(uintptr_t fn, unsigned count, const uint64_t *args) {
     typedef uint64_t (ABI *Fn)(uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t);
     uint64_t a[6]={0};

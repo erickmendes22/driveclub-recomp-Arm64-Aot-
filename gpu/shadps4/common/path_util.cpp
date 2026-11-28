@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <fstream>
+#include <stdexcept>
 #include <unordered_map>
 #include "common/logging/log.h"
 #include "common/path_util.h"
@@ -84,9 +85,17 @@ static std::optional<std::filesystem::path> GetBundleParentDirectory() {
 }
 #endif
 
-static auto UserPaths = [] {
+static auto CreateUserPaths() {
     // bbport: the port keeps GPU caches where BB_GPU_USER_DIR points.
     const char* port_dir = std::getenv("BB_GPU_USER_DIR");
+#ifdef __ANDROID__
+    // JNI sets the private app directory after loading the library. Android
+    // has neither a desktop HOME nor a writable process working directory.
+    if (!port_dir || !*port_dir)
+        throw std::runtime_error("BB_GPU_USER_DIR must be set before Android GPU initialization");
+    const auto user_dir = std::filesystem::path(port_dir);
+    std::filesystem::create_directories(user_dir);
+#else
     auto user_dir = port_dir ? std::filesystem::path(port_dir) : std::filesystem::current_path() / PORTABLE_DIR;
     if (!std::filesystem::exists(user_dir)) {
         // If it doesn't exist, use the standard path for the platform instead.
@@ -107,6 +116,7 @@ static auto UserPaths = [] {
         std::filesystem::create_directories(user_dir);
 #endif
     }
+#endif
 
     std::unordered_map<PathType, fs::path> paths;
 
@@ -151,7 +161,19 @@ static auto UserPaths = [] {
     }
 
     return paths;
-}();
+}
+
+#ifdef __ANDROID__
+static auto& UserPaths() {
+    // Do not touch storage from a shared-library constructor before nativeStart.
+    static auto paths = CreateUserPaths();
+    return paths;
+}
+#else
+// Preserve desktop initialization before main/run.py's existing launch flow.
+static auto user_paths = CreateUserPaths();
+static auto& UserPaths() { return user_paths; }
+#endif
 
 bool ValidatePath(const fs::path& path) {
     if (path.empty()) {
@@ -180,7 +202,7 @@ std::string PathToUTF8String(const std::filesystem::path& path) {
 }
 
 const fs::path& GetUserPath(PathType shad_path) {
-    return UserPaths.at(shad_path);
+    return UserPaths().at(shad_path);
 }
 
 std::string GetUserPathString(PathType shad_path) {
@@ -194,7 +216,7 @@ void SetUserPath(PathType shad_path, const fs::path& new_path) {
         return;
     }
 
-    UserPaths.insert_or_assign(shad_path, new_path);
+    UserPaths().insert_or_assign(shad_path, new_path);
 }
 
 std::optional<fs::path> FindGameByID(const fs::path& dir, const std::string& game_id,

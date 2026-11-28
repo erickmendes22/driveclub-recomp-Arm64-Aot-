@@ -228,6 +228,11 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
                 if (map.result == vk::Result::eSuccess) {
                     std::memset(map.value, 0, block_size);
                     instance.GetDevice().unmapMemory(guard_memory);
+                } else {
+                    // A guard is usable only after it has actually been zeroed.
+                    // Do not bind uninitialized memory to every sparse hole.
+                    instance.GetDevice().freeMemory(guard_memory);
+                    guard_memory = nullptr;
                 }
             }
         }

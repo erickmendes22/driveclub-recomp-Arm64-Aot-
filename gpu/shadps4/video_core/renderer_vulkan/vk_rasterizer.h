@@ -3,8 +3,11 @@
 
 #pragma once
 
+#include <array>
+#include <utility>
 #include <unordered_map>
 
+#include "bbport_mapped_ranges.h"
 #include "common/recursive_lock.h"
 #include "common/shared_first_mutex.h"
 #include "video_core/buffer_cache/buffer_cache.h"
@@ -214,9 +217,11 @@ public:
     bool IsPageGpuModified(VAddr addr);
     void ProcessDownloadImages();
     bool IsMapped(VAddr addr, u64 size);
+    bool IsPhysicallyMapped(VAddr addr, u64 size);
     void MapMemory(VAddr addr, u64 size);
     void RegisterMemory(VAddr addr, u64 size);
     void UnmapMemory(VAddr addr, u64 size);
+    void SetPrtAperture(unsigned id, VAddr addr, u64 size);
 
     u64 Flush();
     void Finish();
@@ -228,9 +233,9 @@ public:
 
     template <typename Func>
     void ForEachMappedRangeInRange(VAddr addr, u64 size, Func&& func) {
-        const auto range = decltype(mapped_ranges)::interval_type::right_open(addr, addr + size);
+        const auto range = BbGpu::MappedMemoryRanges::Set::interval_type::right_open(addr, addr + size);
         Common::RecursiveSharedLock lock{mapped_ranges_mutex};
-        for (const auto& mapped_range : (mapped_ranges & range)) {
+        for (const auto& mapped_range : (memory_ranges.Mapped() & range)) {
             func(mapped_range);
         }
     }
@@ -241,6 +246,8 @@ public:
 #endif
 
 private:
+    template <bool physical>
+    bool IsMappedRange(VAddr addr, u64 size);
     void PrepareRenderState(const GraphicsPipeline* pipeline);
     RenderState BeginRendering(const GraphicsPipeline* pipeline);
     RenderState BeginRenderingFull(const GraphicsPipeline* pipeline);
@@ -424,7 +431,7 @@ private:
     std::unordered_map<VAddr, std::unique_ptr<VideoCore::Buffer>> lighting_lists;
     AmdGpu::Liverpool* liverpool;
     Core::MemoryManager* memory;
-    boost::icl::interval_set<VAddr> mapped_ranges;
+    BbGpu::MappedMemoryRanges memory_ranges;
     Common::SharedFirstMutex mapped_ranges_mutex;
     std::atomic<u64> mapped_ranges_generation{0}; ///< bbport: bumped by every map and unmap
     PipelineCache pipeline_cache;

@@ -4483,7 +4483,8 @@ void Rasterizer::ProcessDownloadImages() {
     texture_cache.ProcessDownloadImages();
 }
 
-bool Rasterizer::IsMapped(VAddr addr, u64 size) {
+template <bool physical>
+bool Rasterizer::IsMappedRange(VAddr addr, u64 size) {
     if (size == 0) {
         // There is no memory, so not mapped.
         return false;
@@ -4492,7 +4493,7 @@ bool Rasterizer::IsMapped(VAddr addr, u64 size) {
         // Memory range wrapped the address space, cannot be mapped.
         return false;
     }
-    const auto range = decltype(mapped_ranges)::interval_type::right_open(addr, addr + size);
+    const auto range = BbGpu::MappedMemoryRanges::Set::interval_type::right_open(addr, addr + size);
 
     // bbport: each thread checks its own copy of the set, taken again after a map or unmap: the
     // shared lock (a mutex and a condition variable per call) showed in the CPU profile. BB_MAPPED_COPIES=0 locks.
@@ -4502,22 +4503,30 @@ bool Rasterizer::IsMapped(VAddr addr, u64 size) {
     }();
     if (!copies || BbToggle::Disabled(BbToggle::MappedRangeCopies)) {
         Common::RecursiveSharedLock lock{mapped_ranges_mutex};
-        return boost::icl::contains(mapped_ranges, range);
+        return boost::icl::contains(physical ? memory_ranges.Physical() : memory_ranges.Mapped(), range);
     }
-    thread_local decltype(mapped_ranges) ranges;
+    thread_local BbGpu::MappedMemoryRanges::Set ranges;
     thread_local u64 generation = ~u64{0};
     if (mapped_ranges_generation.load(std::memory_order_acquire) != generation) {
         Common::RecursiveSharedLock lock{mapped_ranges_mutex};
-        ranges = mapped_ranges;
+        ranges = physical ? memory_ranges.Physical() : memory_ranges.Mapped();
         generation = mapped_ranges_generation.load(std::memory_order_relaxed);
     }
     return boost::icl::contains(ranges, range);
 }
 
+bool Rasterizer::IsMapped(VAddr addr, u64 size) {
+    return IsMappedRange<false>(addr, size);
+}
+
+bool Rasterizer::IsPhysicallyMapped(VAddr addr, u64 size) {
+    return IsMappedRange<true>(addr, size);
+}
+
 void Rasterizer::MapMemory(VAddr addr, u64 size) {
     {
         std::scoped_lock lock{mapped_ranges_mutex};
-        mapped_ranges += decltype(mapped_ranges)::interval_type::right_open(addr, addr + size);
+        memory_ranges.Map(addr, size);
         mapped_ranges_generation.fetch_add(1, std::memory_order_release);
     }
 }
@@ -4532,9 +4541,34 @@ void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
     texture_cache.UnmapMemory(addr, size);
     {
         std::scoped_lock lock{mapped_ranges_mutex};
-        mapped_ranges -= decltype(mapped_ranges)::interval_type::right_open(addr, addr + size);
+        memory_ranges.Unmap(addr, size);
         mapped_ranges_generation.fetch_add(1, std::memory_order_release);
     }
+}
+
+void Rasterizer::SetPrtAperture(unsigned id, VAddr addr, u64 size) {
+    ASSERT_MSG(id < BbGpu::MappedMemoryRanges::ApertureCount, "Invalid PRT aperture {}", id);
+    std::pair<VAddr, u64> previous;
+    {
+        std::scoped_lock lock{mapped_ranges_mutex};
+        previous = memory_ranges.Prt(id);
+    }
+    if (previous == std::pair{addr, size}) {
+        return;
+    }
+    DrainDrawPipe();
+    // Invalidate cached GPU resources from the old aperture, as shadPS4's
+    // SetPrtArea does, while retaining any real CPU mappings in that interval.
+    if (previous.second) {
+        buffer_cache.InvalidateMemory(previous.first, previous.second);
+        texture_cache.UnmapMemory(previous.first, previous.second);
+    }
+    {
+        std::scoped_lock lock{mapped_ranges_mutex};
+        memory_ranges.SetPrt(id, addr, size);
+        mapped_ranges_generation.fetch_add(1, std::memory_order_release);
+    }
+    LOG_INFO(Render, "PRT aperture {}: {:#x}, {} bytes (sparse GPU tracking)", id, addr, size);
 }
 
 void Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool is_indexed) const {

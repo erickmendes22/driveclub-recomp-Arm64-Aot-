@@ -8,10 +8,14 @@
 #include <math.h>
 #include <inttypes.h>
 #include <time.h>
+#include <pthread.h>
 #include "runtime.h"
 #include "../gpu/shim/bbport_diagnostics.h"
 #include "guest_cpu.h"
 #include "gpu/bbgpu.h"
+#if defined(__ANDROID__) && defined(DRIVECLUB_ANDROID_RUNTIME)
+#include "runtime_android.h"
+#endif
 #if !defined(__GNUC__) || (!defined(__x86_64__) && defined(_WIN32))
 #error This prototype requires GCC or Clang, on x86-64 for MinGW.
 #endif
@@ -25,7 +29,11 @@
 #include <ucontext.h>
 #include <fcntl.h>
 #include <dlfcn.h>
+#ifdef __ANDROID__
+#include <unwind.h>
+#else
 #include <execinfo.h>
+#endif
 #include <sys/syscall.h>
 #include <sys/uio.h>
 #endif
@@ -34,8 +42,26 @@
 static unsigned long long start_tick; /* GetTickCount64() at start, for the fault report */
 #endif
 
+#if defined(__ANDROID__) && !defined(_WIN32)
+typedef struct { void **frames; int count, max; } UnwindState;
+static _Unwind_Reason_Code unwind_step(struct _Unwind_Context *context, void *argument) {
+    UnwindState *state = argument;
+    uintptr_t pc = _Unwind_GetIP(context);
+    if (!pc) return _URC_END_OF_STACK;
+    if (state->count >= state->max) return _URC_END_OF_STACK;
+    state->frames[state->count++] = (void *)pc;
+    return _URC_NO_REASON;
+}
+static int backtrace(void **frames, int max) {
+    UnwindState state = {frames, 0, max};
+    _Unwind_Backtrace(unwind_step, &state);
+    return state.count;
+}
+#endif
+
 typedef struct { uint64_t address, size, flags; } Segment;
 typedef struct { uint64_t target, kind, value, addend; } Reloc;
+typedef struct { uintptr_t host[2]; unsigned char used; } ImportResolution;
 static char (*names)[128];
 static uint64_t import_count;
 static unsigned char *image;
@@ -49,15 +75,16 @@ static size_t page_size;
 #include "runtime_replay_seek.inc"
 #include "runtime_resource_entry.inc"
 /* flags bit 0: the module starts when the game loads it (BBPROBE6), see runtime_start_linked_module. */
-typedef struct { uint64_t base, size, init, tls_address, tls_memsz, tls_filesz, tls_module, flags; char name[32]; int started; } LinkedModule;
+typedef struct { uint64_t base, size, init, tls_address, tls_memsz, tls_filesz, tls_module, flags; char name[32]; int started, starting, start_failed; int32_t start_result; } LinkedModule;
 #define MODULE_START_ON_LOAD 1
 static LinkedModule modules[16];
 static uint64_t module_count;
+static pthread_mutex_t module_start_lock=PTHREAD_MUTEX_INITIALIZER;
 static int entered_game;
 static int gpu_enabled;
 int vulkan_smoke(void);
 
-static void fail(const char *message) { fprintf(stderr, "ERROR: %s\n", message); exit(1); }
+static _Noreturn void fail(const char *message) { fprintf(stderr, "ERROR: %s\n", message); exit(1); }
 static uint64_t read64(FILE *f) {
     unsigned char b[8];
     if (fread(b, 1, 8, f) != 8) fail("truncated boot file");
@@ -66,26 +93,56 @@ static uint64_t read64(FILE *f) {
     return n;
 }
 
-/* The game loads a linked module that starts on load (oskGNMm.prx): its initializer runs the module's
- * constructors and then module_start(args, argp), as the PS4 loader does. Returns 1 when path names such a
- * module (*result: what module_start returned), 0 for any other path. */
+int32_t runtime_linked_module_handle(const char *path) {
+    const char *file=path ? strrchr(path,'/') : NULL;
+    file=file ? file+1 : path;
+    if (!file || !*file) return (int32_t)UINT32_C(0x80020002);
+    for (uint64_t m=0;m<module_count;++m)
+        if (!strcmp(modules[m].name,file)) return (int32_t)(0x1000+m);
+    return (int32_t)UINT32_C(0x80020002);
+}
+int runtime_linked_module_pinned(int32_t handle) {
+    return handle>=0x1000 && (uint64_t)(handle-0x1000)<module_count;
+}
+/* Linked modules retain stable handles. Modules flagged start-on-load run their
+ * constructors and module_start(args, argp) here. Returns 1 for a known module
+ * (*result: its cached module_start result), 0 for an unknown path. A negative
+ * Orbis error means start is already in progress or previously failed. */
 int runtime_start_linked_module(const char *path, uint64_t args, const void *argp, int32_t *result) {
     const char *file=path ? strrchr(path,'/') : NULL;
     file=file ? file+1 : path;
     if (!file) return 0;
     for (uint64_t m=0;m<module_count;++m) {
         LinkedModule *x=&modules[m];
-        if (!(x->flags & MODULE_START_ON_LOAD) || strcmp(x->name,file)) continue;
-        int32_t start=0;
-        if (!x->started) {
-            x->started=1;
-            /* Guest code: through the guest CPU, as the other modules' initializers (FEXCore on ARM64). */
-            const uint64_t init_args[3]={args,(uint64_t)(uintptr_t)argp,0};
-            start=(int32_t)guest_cpu_call((uintptr_t)(image+x->init),3,init_args);
-            printf("Runtime: linked module %s started; module_start returned %d\n",x->name,start);
+        if (strcmp(x->name,file)) continue;
+        pthread_mutex_lock(&module_start_lock);
+        if (x->starting) { pthread_mutex_unlock(&module_start_lock); return (int32_t)UINT32_C(0x80020010); }
+        if (x->started || x->start_failed) {
+            int32_t start=x->start_result;
+            int failed=x->start_failed;
+            pthread_mutex_unlock(&module_start_lock);
+            if (result) *result=start;
+            return failed ? (int32_t)UINT32_C(0x80020064) : 1; /* ESTART */
         }
+        if (!(x->flags & MODULE_START_ON_LOAD)) {
+            pthread_mutex_unlock(&module_start_lock);
+            return (int32_t)UINT32_C(0x80020010); /* Boot-time initializer has not completed. */
+        }
+        x->starting=1;
+        pthread_mutex_unlock(&module_start_lock);
+        /* Do not hold the loader lock across guest constructors: they can
+         * load other modules, or reenter this one (which receives EBUSY). */
+        const uint64_t init_args[3]={args,(uint64_t)(uintptr_t)argp,0};
+        int32_t start=(int32_t)guest_cpu_call((uintptr_t)(image+x->init),3,init_args);
+        pthread_mutex_lock(&module_start_lock);
+        x->start_result=start;
+        x->started=start==0;
+        x->start_failed=start!=0;
+        x->starting=0;
+        pthread_mutex_unlock(&module_start_lock);
+        printf("Runtime: linked module %s module_start returned %d%s\n",x->name,start,start ? "; initialization failed" : "; started");
         if (result) *result=start;
-        return 1;
+        return start ? (int32_t)UINT32_C(0x80020064) : 1; /* ESTART; result preserves the module's code. */
     }
     return 0;
 }
@@ -93,14 +150,10 @@ static size_t round_page(size_t size) { return (size + page_size - 1) & ~(page_s
 static void *allocate(size_t size) {
     void *low=runtime_low_map(size,PROT_READ|PROT_WRITE);
     if (low) return low;
-#ifdef _WIN32
-    void *p = VirtualAlloc(NULL, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-    if (!p) fail("VirtualAlloc failed");
-#else
-    void *p = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (p == MAP_FAILED) fail("mmap failed");
-#endif
-    return p;
+    /* The image, traps and patch trampolines contain guest-visible pointers.
+     * Falling back to an unrestricted host mapping can exceed the game's
+     * 40-bit pointer fields, turning an allocation failure into corruption. */
+    fail("cannot allocate low-address guest image or trampoline");
 }
 static void protect(void *p, size_t size, unsigned flags) {
 #ifdef _WIN32
@@ -594,6 +647,9 @@ static uint64_t patch_tcb_loads(const Segment *segments, uint64_t count) {
 }
 #endif
 #ifndef _WIN32
+#ifdef __ANDROID__
+static struct sigaction android_signal_previous[NSIG];
+#endif
 static void fault(int sig, siginfo_t *info, void *context) {
     /* The guest CPU's own faults (FEXCore's JIT), then GPU page tracking (write-protected guest pages). */
     if (guest_cpu_handle_fault(sig, info, context)) return;
@@ -611,6 +667,24 @@ static void fault(int sig, siginfo_t *info, void *context) {
     /* The process is terminating: dladdr/snprintf are acceptable here. */
     GuestRegs regs;
     const int in_guest = guest_cpu_signal_regs(context, &regs);
+#ifdef __ANDROID__
+    /* ART uses SIGSEGV for managed implicit null checks. A separate Android
+     * process still has VM/UI threads, so preserve its signal chain for faults
+     * outside translated guest execution and guest->HLE calls. */
+    int managed=!in_guest;
+#ifdef DRIVECLUB_ANDROID_RUNTIME
+    managed=managed || driveclub_android_in_java();
+#endif
+    if (managed && sig>0 && sig<NSIG) {
+        const struct sigaction *previous=&android_signal_previous[sig];
+        if (previous->sa_handler==SIG_IGN) return;
+        if (previous->sa_handler!=SIG_DFL && previous->sa_handler!=NULL) {
+            if (previous->sa_flags&SA_SIGINFO) previous->sa_sigaction(sig,info,context);
+            else previous->sa_handler(sig);
+            return;
+        }
+    }
+#endif
     uintptr_t rip = in_guest == GUEST_CPU_IN_GUEST ? (uintptr_t)regs.rip : guest_cpu_host_pc(context);
     char line[512];
     Dl_info where;
@@ -1383,6 +1457,11 @@ static void print_system_info(void) {
     }
 }
 #endif
+#if defined(__ANDROID__) && defined(DRIVECLUB_ANDROID_RUNTIME)
+/* The loader owns exit(), signal handlers and process globals. Its Android
+ * caller runs this entry only in the dedicated :runtime process. */
+#define main driveclub_runtime_main
+#endif
 int main(int argc, char **argv) {
 #ifdef _WIN32
     start_tick=GetTickCount64();
@@ -1398,8 +1477,12 @@ int main(int argc, char **argv) {
 #ifndef _WIN32
     /* Keep host heap objects handed to the guest (thread handles, TLS) in the
        non-PIE brk heap, i.e. below 1 TiB: the guest packs pointers into 40 bits. */
+#ifdef __ANDROID__
+    mallopt(M_BIONIC_SET_HEAP_TAGGING_LEVEL, M_HEAP_TAGGING_LEVEL_NONE);
+#else
     mallopt(M_ARENA_MAX,1);
     mallopt(M_MMAP_THRESHOLD,32*1024*1024);
+#endif
     guest_cpu_init(runtime_low_map);
 #endif
     if (argc == 2 && !strcmp(argv[1], "--vulkan-only")) return vulkan_smoke();
@@ -1409,11 +1492,12 @@ int main(int argc, char **argv) {
     runtime_memory_reserve();
     runtime_thread_tcb_offset();
 #endif
-    int cpu_only = 0, strict_imports = 0;
+    int cpu_only = 0, strict_imports = 0, check_imports = 0;
     unsigned timeout_seconds = 10;
     const char *content_profile=NULL, *app0_base_dir=NULL, *app0=NULL, *user_dir=NULL, *patch_file=NULL, *mods_dir[4]={0}; int mods_n=0;
     for (int i = 2; i < argc; ++i) {
         if (!strcmp(argv[i], "--cpu-only")) cpu_only = 1;
+        else if (!strcmp(argv[i], "--check-imports")) check_imports = 1;
         else if (!strcmp(argv[i], "--strict-imports")) strict_imports = 1;
         else if (!strcmp(argv[i], "--content-profile") && i+1<argc) content_profile=argv[++i];
         else if (!strcmp(argv[i], "--app0") && i+1<argc) app0=argv[++i];
@@ -1426,10 +1510,10 @@ int main(int argc, char **argv) {
         else { fprintf(stderr, "Unknown option: %s\n", argv[i]); return 1; }
     }
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s boot.bin [--cpu-only] [--strict-imports] [--content-profile file] [--app0 dir] [--user dir] [--patches file] [--timeout seconds] | --vulkan-only\n", argv[0]);
+        fprintf(stderr, "Usage: %s boot.bin [--cpu-only] [--check-imports] [--strict-imports] [--content-profile file] [--app0 dir] [--user dir] [--patches file] [--timeout seconds] | --vulkan-only\n", argv[0]);
         return 1;
     }
-    if (content_profile) {
+    if (content_profile && !check_imports) {
         FILE *profile=fopen(content_profile,"rb");
         unsigned char data[28];
         if (!profile) fail("cannot open content profile");
@@ -1442,7 +1526,7 @@ int main(int argc, char **argv) {
         }
         runtime_content_configure(values);
     }
-    if (app0) {
+    if (app0 && !check_imports) {
         runtime_file_configure(app0, user_dir ? user_dir : "user");
         runtime_file_set_base(app0_base_dir);
         for (int mi=0;mi<mods_n;++mi) { runtime_file_add_mods(mods_dir[mi]); runtime_benchmark_note_mods(mods_dir[mi]); }
@@ -1457,7 +1541,10 @@ int main(int argc, char **argv) {
         sfo_value(sfo,"APP_VER",version,sizeof(version),NULL);
         bbnet_configure(app0,serial,title,version);
     }
-    bbgpu_register_kernel();
+    /* A complete symbol inventory must not require a Vulkan device, presenter,
+     * network worker or execution of a game initializer. */
+    if (cpu_only && !check_imports) bbgpu_register_kernel();
+    else bbgpu_register_libraries();
 #ifdef _WIN32
     SYSTEM_INFO system_info; GetSystemInfo(&system_info); page_size = system_info.dwPageSize;
     AddVectoredExceptionHandler(1, vectored_fault);
@@ -1479,7 +1566,14 @@ int main(int argc, char **argv) {
     page_size = (size_t)sysconf(_SC_PAGESIZE);
     struct sigaction sa = {0}; sa.sa_sigaction = fault; sa.sa_flags = SA_SIGINFO;
     sigemptyset(&sa.sa_mask);
+#ifdef __ANDROID__
+    sa.sa_flags|=SA_ONSTACK;
+    sigaction(SIGSEGV, &sa, &android_signal_previous[SIGSEGV]);
+    sigaction(SIGILL, &sa, &android_signal_previous[SIGILL]);
+    sigaction(SIGBUS, &sa, &android_signal_previous[SIGBUS]);
+#else
     sigaction(SIGSEGV, &sa, NULL); sigaction(SIGILL, &sa, NULL); sigaction(SIGBUS, &sa, NULL);
+#endif
     Dl_info self_info;
     if (dladdr((void *)main,&self_info)) exe_base=(uintptr_t)self_info.dli_fbase;
     struct sigaction dump = {0}; dump.sa_sigaction = thread_dump; dump.sa_flags = SA_SIGINFO|SA_RESTART;
@@ -1593,13 +1687,58 @@ int main(int argc, char **argv) {
             if (!executable) fail("native function is not executable");
         }
     }
+    ImportResolution *imports=calloc(import_count ? import_count : 1,sizeof(*imports));
+    if (!imports) fail("allocation failed");
+    for (uint64_t i=0;i<nr;++i)
+        if (relocs[i].kind) imports[relocs[i].value].used|=(unsigned char)(1u<<(relocs[i].kind-1));
+    uint64_t host_count[2]={0}, native_count[2]={0}, missing_count[2]={0}, unused_count=0;
+    for (uint64_t i=0;i<import_count;++i) {
+        if (!imports[i].used) { ++unused_count; continue; }
+        for (unsigned kind=1;kind<=2;++kind) {
+            if (!(imports[i].used & (1u<<(kind-1)))) continue;
+            imports[i].host[kind-1]=runtime_resolve(names[i],kind==2);
+            if (imports[i].host[kind-1]) ++host_count[kind-1];
+            else if (native_libc && bindings[i]) {
+                if (binding_kinds[i]!=kind) fail("native export kind mismatch in import preflight");
+                ++native_count[kind-1];
+            } else {
+                ++missing_count[kind-1];
+                printf("Imports: unavailable %s %s (%s), index=%" PRIu64 "\n",
+                    kind==2 ? "data" : "function",names[i],runtime_import_name(names[i]),i);
+            }
+        }
+    }
+    /* Validate the native data addends even in audit-only mode. */
+    for (uint64_t i=0;i<nr;++i) {
+        const Reloc *r=&relocs[i];
+        if (r->kind && !imports[r->value].host[r->kind-1] && native_libc && bindings[r->value] &&
+            !mapped(segments,ns,bindings[r->value],r->addend+1)) fail("native export range mismatch in import preflight");
+    }
+    printf("Imports: host functions=%" PRIu64 " data=%" PRIu64
+           "; linked functions=%" PRIu64 " data=%" PRIu64
+           "; unavailable functions=%" PRIu64 " data=%" PRIu64
+           "; unused names=%" PRIu64 "\n",host_count[0],host_count[1],native_count[0],native_count[1],
+           missing_count[0],missing_count[1],unused_count);
+    if (missing_count[0] || missing_count[1])
+        puts("Imports: unavailable entries are listed before execution; each remains a trap if reached. Their presence does not establish which optional paths will run.");
+    if (check_imports) {
+        const long payload=ftell(f);
+        if (payload<0 || fseek(f,0,SEEK_END)) fail("cannot verify boot image length");
+        const long end=ftell(f);
+        if (end<payload || (uint64_t)(end-payload)!=size) fail("incorrect memory image size");
+        fclose(f);
+        free(imports); free(segments); free(relocs); free(names); free(bindings); free(binding_kinds);
+        puts("Imports: audit complete; no guest initializer or entry point executed.");
+        return missing_count[0] || missing_count[1] ? 20 : 0;
+    }
+    bbgpu_register_kernel();
     image = allocate(round_page(size));
     runtime_image_base = (uintptr_t)image; runtime_image_size = size;
     runtime_diag_start();
     if (fread(image, 1, size, f) != size || fgetc(f) != EOF) fail("incorrect memory image size");
     fclose(f);
     if (!cpu_only) {
-        char title[128]="Bloodborne", serial[16]="UNKNOWN", sfo[4096];
+        char title[128]="Driveclub", serial[16]="UNKNOWN", sfo[4096];
         uint32_t attributes=0;
         snprintf(sfo,sizeof(sfo),"%s/sce_sys/param.sfo",app0 ? app0 : ".");
         sfo_value(sfo,"TITLE",title,sizeof(title),NULL);
@@ -1641,7 +1780,7 @@ int main(int argc, char **argv) {
                         : relocs[i].kind == 1 ? (uintptr_t)(traps + 32 * relocs[i].value)
                         : (uintptr_t)image + relocs[i].value;
         if (relocs[i].kind) {
-            uintptr_t resolved = runtime_resolve(names[relocs[i].value], relocs[i].kind == 2);
+            uintptr_t resolved = imports[relocs[i].value].host[relocs[i].kind-1];
             if (resolved && relocs[i].kind == 1) value = host_entry(resolved);
             else if (resolved) value = resolved + relocs[i].addend;
             else if (native_libc && bindings[relocs[i].value]) {
@@ -1652,6 +1791,7 @@ int main(int argc, char **argv) {
         }
         memcpy(image + relocs[i].target, &value, 8);
     }
+    free(imports);
     if (patch_file) apply_patches(patch_file, segments, ns, relocs, nr);
     if (!cpu_only) env_timelapse_install();
     if (!cpu_only) scene_debug_install();
@@ -1712,11 +1852,19 @@ int main(int argc, char **argv) {
                 continue;
             }
             printf("Starting linked module %" PRIu64 " at image offset 0x%" PRIx64 "; native bindings=%" PRIu64 "\n",m,modules[m].init,nb);
+            pthread_mutex_lock(&module_start_lock);
+            modules[m].starting=1;
+            pthread_mutex_unlock(&module_start_lock);
             const uint64_t init_args[3]={0,0,0};
             int result=(int)guest_cpu_call((uintptr_t)(image+modules[m].init),3,init_args);
+            pthread_mutex_lock(&module_start_lock);
+            modules[m].start_result=result;
+            modules[m].started=result==0;
+            modules[m].start_failed=result!=0;
+            modules[m].starting=0;
+            pthread_mutex_unlock(&module_start_lock);
             printf("Module %" PRIu64 " initializer returned %d\n",m,result);
             if (result) fail("module initializer failed");
-            modules[m].started=1;
         }
     }
     printf("Entering original x86-64 code at guest offset 0x%" PRIx64 "\n", entry);

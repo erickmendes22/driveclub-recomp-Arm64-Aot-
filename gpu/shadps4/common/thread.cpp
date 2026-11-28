@@ -7,6 +7,7 @@
 #include <string>
 #include <thread>
 
+#include "bbport_cpu.h"
 
 #include "common/error.h"
 #include "common/logging/log.h"
@@ -265,7 +266,7 @@ void PreciseSleepUntil(std::chrono::steady_clock::time_point deadline) {
 #endif
     }
     while (steady_clock::now() < deadline) {
-        __builtin_ia32_pause();
+        BbCpu::Pause();
     }
 }
 

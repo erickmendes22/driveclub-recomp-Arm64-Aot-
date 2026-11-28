@@ -2026,8 +2026,7 @@ static void raiseFriendPresence(s64 requestId, const std::string& path,
         ev.targetUserId = userId;
         ev.npServiceName = "inGamePresence";
         ev.hasFrom = true;
-        std::snprintf(ev.fromOnlineId.data, sizeof(ev.fromOnlineId.data) + 1, "%s",
-                      name.c_str());
+        SetNpOnlineId(ev.fromOnlineId, name);
         ev.dataType = "np:service:presence:onlineStatus";
         ev.data = R"({"onlineStatus":"online","platform":"PS4",)" + status_json + "}";
         EnqueuePushEvent(ev);

@@ -30,6 +30,13 @@ void runtime_ffb_release(const char *why);
 typedef void (ABI *GuestCallback)(void);
 void runtime_start(uint64_t capabilities);
 uintptr_t runtime_resolve(const char *name, int is_data);
+uintptr_t runtime_usbd_resolve(const char *name);
+uintptr_t runtime_capture_resolve(const char *name);
+/* Host screenshot policy: enabled=1 permits capture; 0 prevents it. The hook
+ * returns 0 only after the host window changes, -1 on failure. Calls are made
+ * without a runtime mutex; concurrent/reentrant guest changes return EBUSY.
+ * A retired hook must keep its in-flight callback resources alive. */
+void runtime_capture_set_screenshot_hook(int (*hook)(int enabled));
 void runtime_report(void);
 void runtime_finalize(void *dso);
 uintptr_t runtime_mutex_resolve(const char *name);
@@ -42,9 +49,13 @@ uintptr_t runtime_rwlock_resolve(const char *name);
 void runtime_rwlock_report(void);
 void runtime_set_libc_tls(const void *data, uint64_t filesz, uint64_t memsz);
 void runtime_set_module_tls(uint64_t module, const void *data, uint64_t filesz, uint64_t memsz);
+/* Release this thread's dynamic module TLS after all guest destructors. */
+void runtime_tls_cleanup(void);
 void runtime_set_procparam(void *param);
 /* Starts a linked module the game loads itself (probe.c); 1 when path names one. */
 int runtime_start_linked_module(const char *path, uint64_t args, const void *argp, int32_t *result);
+int32_t runtime_linked_module_handle(const char *path);
+int runtime_linked_module_pinned(int32_t handle);
 void **runtime_application_heap_api(void);
 uintptr_t runtime_thread_resolve(const char *name);
 void runtime_thread_report(void);
@@ -96,9 +107,11 @@ int64_t runtime_file_stat(const char *path, void *guest_stat);
 int64_t runtime_file_fstat(int fd, void *guest_stat);
 int64_t runtime_file_getdents(int fd, char *buffer, uint64_t size, int64_t *base);
 void runtime_thread_keys_cleanup(void);
+void runtime_thread_cleanup(void);
 /* Guest-visible errno values are FreeBSD's. */
 int32_t runtime_guest_errno(int host_errno);
 void *runtime_low_map(size_t size, int prot);
+int runtime_low_unmap(void *address, size_t size);
 /* Windows: reserves the PS4 user address range as a placeholder (no-op elsewhere). */
 void runtime_memory_reserve(void);
 /* Blocked-thread diagnostic (runtime_diag.c): threads.txt in the user dir lists long waits. */
@@ -114,6 +127,9 @@ uintptr_t runtime_evf_resolve(const char *name);
 uintptr_t runtime_ss_resolve(const char *name);
 /* Anonymous private mapping for libkernel mmap; 0 on success. */
 int runtime_memory_map_anonymous(void **inout, uint64_t size, int prot);
+/* Sparse GPU aperture metadata; registration replays all three slots. A zero
+ * size disables a slot and never implies a CPU mapping or physical allocation. */
+void runtime_memory_set_prt_hook(void (*hook)(unsigned id, uintptr_t address, uint64_t size));
 uintptr_t runtime_ajm_resolve(const char *name);
 void runtime_ajm_report(void);
 uintptr_t runtime_audio_resolve(const char *name);

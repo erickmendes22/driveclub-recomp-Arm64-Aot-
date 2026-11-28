@@ -17,8 +17,13 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <time.h>
+#if defined(__ANDROID__) && defined(DRIVECLUB_ANDROID_RUNTIME)
+#include "runtime_android.h"
+#define ANDROID_DOCUMENT_FILES 1
+#endif
 #ifdef _WIN32
 #include <windows.h>
+#include <sys/utime.h>
 /* 64-bit sizes and times; directories are never opened as CRT descriptors. */
 typedef struct _stat64 HostStat;
 #define host_stat(path,s) _stat64(path,s)
@@ -26,6 +31,7 @@ typedef struct _stat64 HostStat;
 #define host_lseek _lseeki64
 #define O_DIRECTORY 0x40000000 /* bbport marker, removed before _open */
 #else
+#include <sys/time.h>
 typedef struct stat HostStat;
 #define host_stat(path,s) stat(path,s)
 #define host_fstat(fd,s) fstat(fd,s)
@@ -36,6 +42,7 @@ typedef struct stat HostStat;
 #define MAX_MOUNTS 16
 
 typedef struct { int64_t sec, nsec; } GuestTimespec;
+typedef struct { int64_t sec, usec; } GuestTimeval;
 typedef struct {
     uint32_t dev, ino;
     uint16_t mode, nlink;
@@ -230,6 +237,12 @@ static int folder_present(const char *key,size_t length,const char *host) {
 /* Resolve a guest path to a host path; returns 0 or a host errno. */
 static int translate(const char *guest,char *out,size_t size) {
     if (!guest || !*guest) return ENOENT;
+#ifdef ANDROID_DOCUMENT_FILES
+    /* Font, trophy and AVPlayer clients need a host path. This route holds a
+     * provider descriptor for that resource; ordinary guest open/stat below
+     * use short-lived descriptors and never materialize a large archive. */
+    if (driveclub_android_is_game_path(guest)) return driveclub_android_resolve(guest,out,size);
+#endif
     char buffer[1024];
     guest_key(guest,buffer,sizeof(buffer));
     for (const char *p=buffer;(p=strstr(p,".."));p+=2)
@@ -305,6 +318,61 @@ static int host_flags(int flags) {
     return r|O_CLOEXEC;
 }
 static void free_listing(Listing *l) { if (l) { free(l->names); free(l->offsets); free(l->types); free(l); } }
+#ifdef ANDROID_DOCUMENT_FILES
+static Listing *list_android_directory(const char *path,int *error) {
+    char **entries=NULL; size_t count=0;
+    *error=driveclub_android_list(path,&entries,&count);
+    if (*error) return NULL;
+    Listing *l=calloc(1,sizeof(*l));
+    const size_t total=count+2;
+    size_t bytes=5; /* '.' and '..', including their terminators */
+    for (size_t i=0;i<count;++i) bytes+=strlen(entries[i]+2)+1;
+    if (l) {
+        l->names=malloc(bytes); l->offsets=malloc(total*sizeof(*l->offsets)); l->types=malloc(total);
+    }
+    if (!l || !l->names || !l->offsets || !l->types) {
+        free_listing(l); driveclub_android_free_list(entries,count); *error=ENOMEM; return NULL;
+    }
+    memcpy(l->names,".\0..\0",5);
+    l->offsets[0]=0; l->offsets[1]=2; l->types[0]=l->types[1]=4;
+    size_t at=5;
+    for (size_t i=0;i<count;++i) {
+        size_t n=strlen(entries[i]+2)+1;
+        l->offsets[i+2]=at; l->types[i+2]=entries[i][0]=='d' ? 4 : 8;
+        memcpy(l->names+at,entries[i]+2,n); at+=n;
+    }
+    l->count=total;
+    driveclub_android_free_list(entries,count);
+    return l;
+}
+static int64_t open_android_game(const char *guest,int flags) {
+    HostStat s;
+    int error=driveclub_android_stat(guest,&s),host=-1;
+    Listing *dir=NULL;
+    if (error) {
+        if (error==ENOENT) { ++missing; log_missing(guest); }
+        return -error;
+    }
+    if (S_ISDIR(s.st_mode)) {
+        dir=list_android_directory(guest,&error);
+        if (!dir) return -error;
+    } else {
+        if (flags&0x20000) return -ENOTDIR;
+        host=driveclub_android_open(guest);
+        if (host<0) return host;
+    }
+    pthread_mutex_lock(&lock);
+    int fd=-1;
+    for (int i=3;i<MAX_FILES;++i) if (!files[i].used) { fd=i; break; }
+    if (fd<0) { pthread_mutex_unlock(&lock); if (host>=0) close(host); free_listing(dir); return -EMFILE; }
+    files[fd]=(File){.used=1,.host=host,.dir=dir};
+    snprintf(files[fd].path,sizeof(files[fd].path),"%s",guest);
+    ++opens;
+    pthread_mutex_unlock(&lock);
+    if (opens<=300) printf("Runtime: Android open(%s) -> fd %d, %lld bytes\n",guest,fd,(long long)s.st_size);
+    return fd;
+}
+#endif
 static Listing *list_directory(const char *path) {
     DIR *d=opendir(path);
     if (!d) return NULL;
@@ -378,6 +446,9 @@ static int game_path(const char *p) {
 /* All operations return >=0 or -(host errno); wrappers adapt the convention. */
 static int64_t do_open(const char *guest,int flags,int mode) {
     if (game_path(guest) && (flags & (3|0x8|0x200|0x400|0x800))) return -EROFS;
+#ifdef ANDROID_DOCUMENT_FILES
+    if (driveclub_android_is_game_path(guest)) return open_android_game(guest,flags);
+#endif
     char path[1024];
     const uint64_t started=file_now_us();
     int e=translate(guest,path,sizeof(path));
@@ -456,6 +527,52 @@ static int host_fd(int fd) {
     if (fd>=0 && fd<3) return fd;
     File *f=get(fd);
     return f ? f->host : -1;
+}
+static int64_t do_futimes(int fd,const GuestTimeval *times) {
+    GuestTimeval value[2];
+    if (times) {
+        memcpy(value,times,sizeof(value));
+        if (value[0].usec<0 || value[0].usec>=1000000 || value[1].usec<0 || value[1].usec>=1000000)
+            return -EINVAL;
+    }
+    /* Hold the descriptor table across the host operation so a concurrent
+     * guest close cannot reuse this host fd for a different file. Game trees
+     * remain read-only, including provider descriptors opened through SAF. */
+    pthread_mutex_lock(&lock);
+    File *file=get(fd);
+    if (!file) { pthread_mutex_unlock(&lock); return -EBADF; }
+    if (game_path(file->path)) { pthread_mutex_unlock(&lock); return -EROFS; }
+    int result;
+#ifdef _WIN32
+    struct __utimbuf64 converted;
+    if (times) { converted.actime=value[0].sec; converted.modtime=value[1].sec; }
+    if (file->host>=0) result=_futime64(file->host,times ? &converted : NULL);
+    else {
+        /* Windows directory entries have no CRT fd. Snapshot the guest path
+         * before translate takes the same mount/table lock. */
+        char guest[sizeof(file->path)];
+        memcpy(guest,file->path,sizeof(guest));
+        pthread_mutex_unlock(&lock);
+        char path[1024];
+        int error=translate(guest,path,sizeof(path));
+        if (error) return -error;
+        result=_utime64(path,times ? &converted : NULL);
+        return result ? -errno : 0;
+    }
+#else
+    struct timeval converted[2];
+    if (times) {
+        for (unsigned i=0;i<2;++i) {
+            converted[i].tv_sec=(time_t)value[i].sec;
+            converted[i].tv_usec=(suseconds_t)value[i].usec;
+        }
+    }
+    if (file->host<0) { pthread_mutex_unlock(&lock); return -EBADF; }
+    result=futimes(file->host,times ? converted : NULL);
+#endif
+    const int error=result ? errno : 0;
+    pthread_mutex_unlock(&lock);
+    return error ? -error : 0;
 }
 #ifdef _WIN32
 /* The CRT reads and writes at most INT_MAX bytes per call. */
@@ -537,6 +654,18 @@ static int64_t do_lseek(int fd,int64_t offset,int whence) {
 static int64_t do_fstat(int fd,GuestStat *out) {
     int h=host_fd(fd);
     HostStat s;
+#ifdef ANDROID_DOCUMENT_FILES
+    if (h<0) {
+        File *f=get(fd);
+        if (!f || !f->dir) return -EBADF;
+        if (!out) return -EFAULT;
+        if (driveclub_android_is_game_path(f->path)) {
+            int error=driveclub_android_stat(f->path,&s);
+            if (error) return -error;
+            convert_stat(&s,out); return 0;
+        }
+    }
+#endif
 #ifdef _WIN32
     if (h<0) { /* directory: a listing only, stat the path it was opened with */
         File *f=get(fd); char path[1024];
@@ -554,6 +683,14 @@ static int64_t do_fstat(int fd,GuestStat *out) {
 }
 static int64_t do_stat(const char *guest,GuestStat *out) {
     char path[1024]; HostStat s;
+#ifdef ANDROID_DOCUMENT_FILES
+    if (driveclub_android_is_game_path(guest)) {
+        if (!out) return -EFAULT;
+        int error=driveclub_android_stat(guest,&s);
+        if (error) return -error;
+        convert_stat(&s,out); return 0;
+    }
+#endif
     const uint64_t started=file_now_us();
     int e=translate(guest,path,sizeof(path));
     if (e) return -e;
@@ -647,6 +784,15 @@ static int64_t do_truncate(const char *guest,int64_t length) {
 }
 static int64_t do_fsync(int fd) { int h=host_fd(fd); if (h<0) return -EBADF; return fsync(h) ? -errno : 0; }
 static int64_t do_access(const char *guest,int mode) {
+#ifdef ANDROID_DOCUMENT_FILES
+    if (driveclub_android_is_game_path(guest)) {
+        if (mode&W_OK) return -EROFS;
+        HostStat s;
+        const int error=driveclub_android_stat(guest,&s);
+        if (error) return -error;
+        return (mode&X_OK) && !S_ISDIR(s.st_mode) ? -EACCES : 0;
+    }
+#endif
     char path[1024];
     const uint64_t started=file_now_us();
     int e=translate(guest,path,sizeof(path));
@@ -681,6 +827,7 @@ PAIR(rename,(const char *a,const char *b),(a,b))
 PAIR(ftruncate,(int fd,int64_t l),(fd,l))
 PAIR(truncate,(const char *p,int64_t l),(p,l))
 PAIR(fsync,(int fd),(fd))
+PAIR(futimes,(int fd,const GuestTimeval *times),(fd,times))
 static ABI int64_t posix_access(const char *p,int m) { return posix(do_access(p,m)); }
 static ABI int64_t sce_getdents_orbis(int fd,char *b,uint64_t n) { return sce(do_getdents_orbis(fd,b,n)); }
 static ABI int64_t sce_mkdir(const char *p,int m) { return sce(path_op(p,0,m)); }
@@ -709,6 +856,7 @@ static const RuntimeExport exports[]={
     {"sceKernelFtruncate",sce_ftruncate}, {"ftruncate",posix_ftruncate},
     {"sceKernelTruncate",sce_truncate}, {"truncate",posix_truncate},
     {"sceKernelFsync",sce_fsync}, {"fsync",posix_fsync},
+    {"sceKernelFutimes",sce_futimes}, {"futimes",posix_futimes},
     {"access",posix_access}, {"sceKernelCheckReachability",sce_check_reachability},
     {"sceKernelMkdir",sce_mkdir}, {"mkdir",posix_mkdir},
     {"sceKernelRmdir",sce_rmdir}, {"rmdir",posix_rmdir},

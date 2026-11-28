@@ -8,6 +8,8 @@
 #include <time.h>
 
 #define ERR_INVALID_POINTER ((int32_t)0x80B50002)
+#define ERR_INVALID_VALUE ((int32_t)0x80B50003)
+#define ERR_BAD_PARSE ((int32_t)0x80B50007)
 #define ERR_INVALID_YEAR ((int32_t)0x80B50008)
 #define ERR_INVALID_MONTH ((int32_t)0x80B50009)
 #define ERR_INVALID_DAY ((int32_t)0x80B5000A)
@@ -144,6 +146,67 @@ static ABI int32_t rtc_rfc2822_local(char *out, const uint64_t *utc_tick) {
     return 0;
 }
 
+static int parse_digits(const char **cursor,unsigned count,uint16_t *value) {
+    unsigned result=0;
+    for (unsigned i=0;i<count;++i) {
+        unsigned char c=(unsigned char)**cursor;
+        if (c<'0' || c>'9') return 0;
+        result=result*10+c-'0';
+        ++*cursor;
+    }
+    *value=(uint16_t)result;
+    return 1;
+}
+static int parse_separator(const char **cursor,char separator) {
+    if (**cursor!=separator) return 0;
+    ++*cursor;
+    return 1;
+}
+/* RFC 3339 numeric offset is local-minus-UTC, so it is subtracted. Fractional
+ * seconds are scaled to the native microsecond resolution (extra digits are
+ * truncated). All failures leave the caller's output tick untouched. The RTC
+ * calendar model has no leap-second table: second 60 is rejected as by GetTick. */
+static ABI int32_t rtc_parse_rfc3339(uint64_t *tick,const char *text) {
+    if (!tick || !text) return ERR_INVALID_POINTER;
+    const char *p=text;
+    DateTime t={0};
+    if (!parse_digits(&p,4,&t.year) || !parse_separator(&p,'-') ||
+        !parse_digits(&p,2,&t.month) || !parse_separator(&p,'-') || !parse_digits(&p,2,&t.day))
+        return ERR_BAD_PARSE;
+    if (*p!='T' && *p!='t') return ERR_BAD_PARSE;
+    ++p;
+    if (!parse_digits(&p,2,&t.hour) || !parse_separator(&p,':') ||
+        !parse_digits(&p,2,&t.minute) || !parse_separator(&p,':') || !parse_digits(&p,2,&t.second))
+        return ERR_BAD_PARSE;
+    if (*p=='.') {
+        ++p;
+        if (*p<'0' || *p>'9') return ERR_BAD_PARSE;
+        unsigned digits=0;
+        while (*p>='0' && *p<='9') {
+            if (digits<6) { t.microsecond=t.microsecond*10+(unsigned)(*p-'0'); ++digits; }
+            ++p;
+        }
+        while (digits++<6) t.microsecond*=10;
+    }
+    int64_t offset=0;
+    if (*p=='Z' || *p=='z') ++p;
+    else if (*p=='+' || *p=='-') {
+        const int sign=*p++=='+' ? 1 : -1;
+        uint16_t hours,minutes;
+        if (!parse_digits(&p,2,&hours) || !parse_separator(&p,':') ||
+            !parse_digits(&p,2,&minutes) || hours>23 || minutes>59) return ERR_BAD_PARSE;
+        offset=sign*((int64_t)hours*60+minutes)*60000000;
+    } else return ERR_BAD_PARSE;
+    if (*p) return ERR_BAD_PARSE;
+    int32_t error=validate(&t);
+    if (error) return error;
+    const int64_t utc=(int64_t)to_tick(&t)-offset;
+    const DateTime last={9999,12,31,23,59,59,999999};
+    if (utc<0 || (uint64_t)utc>to_tick(&last)) return ERR_INVALID_VALUE;
+    *tick=(uint64_t)utc;
+    return 0;
+}
+
 static const RuntimeExport exports[]={
     {"sceRtcGetCurrentClockLocalTime",rtc_current_local}, {"sceRtcGetCurrentClock",rtc_current_clock},
     {"sceRtcGetCurrentTick",rtc_current_tick}, {"sceRtcGetCurrentNetworkTick",rtc_current_tick},
@@ -151,5 +214,6 @@ static const RuntimeExport exports[]={
     {"sceRtcGetDayOfWeek",rtc_day_of_week}, {"sceRtcGetTick",rtc_get_tick}, {"sceRtcSetTick",rtc_set_tick},
     {"sceRtcGetTickResolution",rtc_tick_resolution}, {"sceRtcSetTime_t",rtc_set_time_t},
     {"sceRtcGetTime_t",rtc_get_time_t}, {"sceRtcFormatRFC2822LocalTime",rtc_rfc2822_local},
+    {"sceRtcParseRFC3339",rtc_parse_rfc3339},
 };
 uintptr_t runtime_rtc_resolve(const char *name) { return RUNTIME_LOOKUP(exports,name); }

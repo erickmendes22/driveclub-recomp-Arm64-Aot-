@@ -217,7 +217,7 @@ Instance::Instance(const Frontend::WindowSystemInfo& window_info, s32 physical_d
                VK_VERSION_MAJOR(TargetVulkanApiVersion), VK_VERSION_MINOR(TargetVulkanApiVersion),
                VK_VERSION_MAJOR(properties.apiVersion), VK_VERSION_MINOR(properties.apiVersion));
 
-    CreateDevice();
+    ASSERT_MSG(CreateDevice(), "Could not create the Vulkan device required by the renderer");
     CollectPhysicalMemoryInfo();
     CollectImageFormatInfo();
     CollectToolingInfo();
@@ -488,16 +488,19 @@ bool Instance::CreateDevice() {
     }
 
     bool graphics_queue_found = false;
+    constexpr auto required_queue_flags = vk::QueueFlagBits::eGraphics |
+                                          vk::QueueFlagBits::eCompute |
+                                          vk::QueueFlagBits::eSparseBinding;
     for (std::size_t i = 0; i < family_properties.size(); i++) {
         const u32 index = static_cast<u32>(i);
-        if (family_properties[i].queueFlags & vk::QueueFlagBits::eGraphics) {
+        if ((family_properties[i].queueFlags & required_queue_flags) == required_queue_flags) {
             queue_family_index = index;
             graphics_queue_found = true;
         }
     }
 
     if (!graphics_queue_found) {
-        LOG_CRITICAL(Render_Vulkan, "Unable to find graphics and/or present queues.");
+        LOG_CRITICAL(Render_Vulkan, "Unable to find a queue supporting graphics, compute and sparse binding.");
         return false;
     }
 
@@ -557,14 +560,26 @@ bool Instance::CreateDevice() {
         }
     }
     // bbport: BB_SPARSE_ALIASED=0 leaves aliased sparse binding off.
-    // Default on for AMD only, where the driver drops the old mapping of memory that a second sparse
-    // buffer binds; NVIDIA and Intel keep what they had. BB_SPARSE_ALIASED=1 / 0 forces it on / off.
+    // Arena migration binds the same memory in both the old and new buffers.
+    // Turnip, like AMD, must use the advertised sparse aliasing feature for that
+    // overlap and for the shared zero guard page. Keep the legacy default for
+    // other drivers; an override never enables an unsupported feature.
     const bool sparse_aliased = features.sparseResidencyAliased && [&] {
         const char* env = std::getenv("BB_SPARSE_ALIASED");
-        return env ? env[0] != '0' : properties.vendorID == 0x1002;
+        return env ? env[0] != '0'
+                   : properties.vendorID == 0x1002 || driver_id == vk::DriverId::eMesaTurnip;
     }();
     VideoCore::sparse_aliased_enabled = sparse_aliased;
     std::printf("GPU: sparse aliased binding %s\n", sparse_aliased ? "on" : "off");
+    std::printf("GPU: sparse binding %s, sparse buffer residency %s, graphics queue sparse binding %s\n",
+                features.sparseBinding ? "yes" : "no",
+                features.sparseResidencyBuffer ? "yes" : "no",
+                (family_properties[queue_family_index].queueFlags & vk::QueueFlagBits::eSparseBinding)
+                    ? "yes" : "no");
+    ASSERT_MSG(features.sparseBinding && features.sparseResidencyBuffer &&
+                   (family_properties[queue_family_index].queueFlags & vk::QueueFlagBits::eSparseBinding),
+               "Renderer requires sparse buffer residency and a graphics queue with sparse binding; "
+               "the selected Vulkan driver does not provide them");
     vk::StructureChain device_chain = {
         vk::DeviceCreateInfo{
             .queueCreateInfoCount = 1u,
@@ -583,6 +598,7 @@ bool Instance::CreateDevice() {
                 .dualSrcBlend = features.dualSrcBlend,
                 .logicOp = features.logicOp,
                 .multiDrawIndirect = features.multiDrawIndirect,
+                .drawIndirectFirstInstance = features.drawIndirectFirstInstance,
                 .depthClamp = features.depthClamp,
                 .depthBiasClamp = features.depthBiasClamp,
                 .fillModeNonSolid = features.fillModeNonSolid,
@@ -595,10 +611,14 @@ bool Instance::CreateDevice() {
                 .shaderImageGatherExtended = features.shaderImageGatherExtended,
                 .shaderStorageImageExtendedFormats = features.shaderStorageImageExtendedFormats,
                 .shaderStorageImageMultisample = features.shaderStorageImageMultisample,
+                // Recompiled storage-image shaders declare both formatless
+                // read and write capabilities (emit_spirv.cpp).
+                .shaderStorageImageReadWithoutFormat = features.shaderStorageImageReadWithoutFormat,
                 // bbport: required by the FSR 3 accumulate shaders (vk_temporal_upscaler).
                 .shaderStorageImageWriteWithoutFormat =
                     features.shaderStorageImageWriteWithoutFormat,
                 .shaderClipDistance = features.shaderClipDistance,
+                .shaderCullDistance = features.shaderCullDistance,
                 .shaderFloat64 = features.shaderFloat64,
                 .shaderInt64 = features.shaderInt64,
                 .shaderInt16 = features.shaderInt16,

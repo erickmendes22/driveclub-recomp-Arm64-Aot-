@@ -22,6 +22,9 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#ifndef MAP_FIXED_NOREPLACE
+#define MAP_FIXED_NOREPLACE 0x100000
+#endif
 #endif
 /* sceKernelGetDirectMemorySize on retail PS4: 5056 MiB. BB_DMEM_MB raises it (the resolution
  * patches above 1080p need about 4 GiB more; run.sh sets it). */
@@ -40,16 +43,23 @@ static uint64_t pool_size_bytes(void) {
 #define PAGE UINT64_C(16384)
 #define USER_MIN UINT64_C(0x1000000000)
 #define USER_MAX UINT64_C(0xfc00000000)
+/* Keep the 64--128 GiB band available for Driveclub's later fixed PRT aliases.
+ * This is an allocation preference, not a reduced guest memory budget or a
+ * claim about the host's VA width. Valid hints elsewhere are still honored. */
+#define NONFIXED_START UINT64_C(0x6000000000)
 #define LIMIT 4096
 #define INVALID ((int32_t)UINT32_C(0x80020016))
 #define NO_MEMORY ((int32_t)UINT32_C(0x8002000c))
 #define ACCESS ((int32_t)UINT32_C(0x8002000d))
 #define NO_SPACE ((int32_t)UINT32_C(0x80020023))
+#define BAD_ADDRESS ((int32_t)UINT32_C(0x8002000e))
+#define NOT_FOUND ((int32_t)UINT32_C(0x80020002))
+#define NAME_TOO_LONG ((int32_t)UINT32_C(0x8002003f))
 #define MAP_FIXED_FLAG 0x10
 #define MAP_NO_OVERWRITE 0x80
 enum { KIND_RESERVED=1, KIND_DIRECT, KIND_FLEXIBLE };
 typedef struct { uint64_t start, size; int type, used; } Block;
-typedef struct { uintptr_t start, end; int kind, prot, type; uint64_t phys; } Vma;
+typedef struct { uintptr_t start, end; int kind, prot, type; uint64_t phys; char name[32]; } Vma;
 typedef struct {
     uintptr_t start, end; uint64_t offset; int32_t protection, memory_type;
     uint32_t flags; char name[32];
@@ -145,6 +155,20 @@ typedef struct { int kind; uintptr_t address; uint64_t size; } PendingHook;
 static PendingHook pending[64]; static size_t pending_count;
 static size_t allocations, maps, flexible_maps, protects, queries;
 static uint64_t live_bytes, flexible_bytes;
+/* A PRT aperture describes sparse GPU address space, not a CPU mapping or a
+ * physical allocation. The backing pages are installed separately by
+ * MapDirectMemory (Driveclub uses fixed aliases starting at 64 GiB).
+ * OpenOrbis declares Set/GetPrtAperture with this ABI. shadPS4's kernel
+ * memory.cpp uses three slots, 4 KiB base alignment and this user VA range;
+ * its MemoryManager::SetPrtArea registers sparse GPU coverage separately. */
+enum { PRT_APERTURES=3 };
+typedef struct { uintptr_t address; uint64_t size; } PrtAperture;
+typedef void (*GpuPrtAperture)(unsigned id, uintptr_t address, uint64_t size);
+static PrtAperture prt_apertures[PRT_APERTURES];
+static GpuPrtAperture hook_prt;
+/* Serialize publication and callback/replay, while allowing the renderer to
+ * query VMAs from a callback without holding the memory table writer lock. */
+static pthread_mutex_t prt_mutex=PTHREAD_MUTEX_INITIALIZER;
 /* A refused memory request is logged (the first dozen), so a crash that follows it can be explained. */
 static int32_t mem_fail(int32_t code, int line) {
     static volatile long reported[2048]; /* three per place: the game probes some requests on purpose */
@@ -160,6 +184,7 @@ static int host_prot(int prot) {
     /* GPU read/write bits (0x10/0x20) need host access for the future GPU backend. */
     return ((prot & 0x11) ? PROT_READ : 0) | ((prot & 0x22) ? PROT_WRITE|PROT_READ : 0) | ((prot & 4) ? PROT_EXEC|PROT_READ : 0);
 }
+
 #ifdef _WIN32
 /* ---- host mappings (Windows) ----
  * [USER_MIN,USER_MAX) is covered by regions, each one placeholder or one view of the
@@ -273,7 +298,8 @@ static size_t carve_host(uintptr_t a, uintptr_t b) {
     free(runs);
     return at;
 }
-static int host_map(uintptr_t address, uint64_t size, int prot, int reserved, uint64_t phys) {
+static int host_map(uintptr_t address, uint64_t size, int prot, int reserved, uint64_t phys, int fixed) {
+    (void)fixed; /* The Windows guest address range is already owned as placeholders. */
     size_t i=carve_host(address,address+size);
     if (reserved) return 0;
     regions[i].phys=phys; regions[i].mapped=1;
@@ -338,11 +364,26 @@ static int pool(void) {
     return 0;
 }
 void runtime_memory_reserve(void) {}
-static int host_map(uintptr_t address, uint64_t size, int prot, int reserved, uint64_t phys) {
-    void *mapped = !reserved
-        ? mmap((void *)address,size,prot,MAP_SHARED|MAP_FIXED,pool_fd,(off_t)phys)
-        : mmap((void *)address,size,PROT_NONE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE|MAP_FIXED,-1,0);
-    return mapped==MAP_FAILED ? -1 : 0;
+static int host_map(uintptr_t address, uint64_t size, int prot, int reserved, uint64_t phys, int fixed) {
+    const int flags=(reserved ? MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE : MAP_SHARED)
+                   | (fixed ? MAP_FIXED : MAP_FIXED_NOREPLACE);
+    void *mapped=mmap((void *)address,size,reserved ? PROT_NONE : prot,flags,
+                      reserved ? -1 : pool_fd,reserved ? 0 : (off_t)phys);
+    if (mapped!=MAP_FAILED && (uintptr_t)mapped==address) return 0;
+    int error=errno;
+    if (mapped!=MAP_FAILED) {
+        /* An older kernel can ignore NOREPLACE and treat the address as a hint.
+         * Never register that mapping as though it existed at the requested VA. */
+        const int unmapped=munmap(mapped,size);
+        error=unmapped ? errno : EOPNOTSUPP;
+    }
+    fprintf(stderr,"Runtime: host mmap failed: address=0x%" PRIxPTR ", end=0x%" PRIxPTR
+            ", bytes=%" PRIu64 ", prot=0x%x, flags=0x%x, backing=%s, offset=0x%" PRIx64
+            ", errno=%d (%s)\n",address,address+size,size,reserved ? PROT_NONE : prot,flags,
+            reserved ? "reservation" : phys>=POOL_SIZE ? "flexible" : "direct",reserved ? UINT64_C(0) : phys,
+            error,strerror(error));
+    errno=error;
+    return -1;
 }
 static int host_unmap(uintptr_t address, uint64_t size) { return munmap((void *)address,size); }
 static int host_protect(uintptr_t address, uint64_t size, int prot) { return mprotect((void *)address,size,prot); }
@@ -391,13 +432,21 @@ static size_t vma_index(uintptr_t a) { /* first VMA with end > a */
     while (lo<hi) { size_t mid=(lo+hi)/2; if (vmas[mid].end<=a) lo=mid+1; else hi=mid; }
     return lo;
 }
-static int vma_insert(size_t at, Vma v) {
-    if (vma_count==vma_capacity) {
-        size_t capacity=vma_capacity ? vma_capacity*2 : 256;
-        Vma *next=realloc(vmas,capacity*sizeof(*vmas));
-        if (!next) return -1;
-        vmas=next; vma_capacity=capacity;
+static int vma_reserve(size_t needed) {
+    if (needed<=vma_capacity) return 0;
+    if (needed>SIZE_MAX/sizeof(*vmas)) return -1;
+    size_t capacity=vma_capacity ? vma_capacity : 256;
+    while (capacity<needed) {
+        if (capacity>SIZE_MAX/2/sizeof(*vmas)) { capacity=needed; break; }
+        capacity*=2;
     }
+    Vma *next=realloc(vmas,capacity*sizeof(*vmas));
+    if (!next) return -1;
+    vmas=next; vma_capacity=capacity;
+    return 0;
+}
+static int vma_insert(size_t at, Vma v) {
+    if (vma_count==SIZE_MAX || vma_reserve(vma_count+1)) return -1;
     memmove(vmas+at+1,vmas+at,(vma_count-at)*sizeof(*vmas));
     vmas[at]=v; ++vma_count; return 0;
 }
@@ -409,9 +458,10 @@ static int split_at(uintptr_t a) {
     if (i==vma_count || vmas[i].start>=a) return 0;
     Vma right=vmas[i];
     right.start=a;
-    if (right.kind==KIND_DIRECT) right.phys+=a-vmas[i].start;
+    if (right.kind!=KIND_RESERVED) right.phys+=a-vmas[i].start;
+    if (vma_insert(i+1,right)) return -1;
     vmas[i].end=a;
-    return vma_insert(i+1,right);
+    return 0;
 }
 /* Range [start,end) split on its edges; returns the first index inside it. */
 static size_t carve(uintptr_t start, uintptr_t end, int *error) {
@@ -433,13 +483,39 @@ static int overlaps(uintptr_t start, uintptr_t end, int ignore_reserved) {
 }
 /* First-fit search in the PS4 user range, starting from the hint. */
 static uintptr_t find_free(uintptr_t hint, uint64_t size, uint64_t alignment) {
-    uintptr_t at=align_up(hint<USER_MIN ? USER_MIN : hint, alignment);
-    for (size_t i=vma_index(at); at+size<=USER_MAX; ++i) {
+    if (hint<USER_MIN) hint=USER_MIN;
+    if (hint>USER_MAX || alignment-1>USER_MAX-hint) return 0;
+    uintptr_t at=align_up(hint, alignment);
+    for (size_t i=vma_index(at); at<=USER_MAX && size<=USER_MAX-at; ++i) {
         if (i==vma_count || vmas[i].start>=at+size) return at;
+        if (vmas[i].end>USER_MAX || alignment-1>USER_MAX-vmas[i].end) return 0;
         at=align_up(vmas[i].end,alignment);
     }
     return 0;
 }
+#ifndef _WIN32
+/* The guest VMA table does not contain ART, FEX, driver or libc mappings. Use
+ * the host's map snapshot to skip those too; NOREPLACE on the real mapping is
+ * still required because another host thread can map after this snapshot. */
+static uintptr_t find_host_free(uint64_t size, uint64_t alignment) {
+    uintptr_t at=find_free(NONFIXED_START,size,alignment);
+    if (!at) { errno=ENOMEM; return 0; }
+    FILE *file=fopen("/proc/self/maps","r");
+    if (!file) return 0;
+    char line[1024];
+    while (fgets(line,sizeof(line),file)) {
+        uintptr_t start,end;
+        if (sscanf(line,"%" SCNxPTR "-%" SCNxPTR,&start,&end)!=2 || end<=at) continue;
+        if (start>=at && size<=start-at) break;
+        at=find_free(end,size,alignment);
+        if (!at) break;
+    }
+    const int error=ferror(file) ? (errno ? errno : EIO) : at ? 0 : ENOMEM;
+    fclose(file);
+    if (error) { errno=error; return 0; }
+    return at;
+}
+#endif
 static void drop_range(uintptr_t start, uintptr_t end) {
     int error; size_t i=carve(start,end,&error), n=0;
     while (i+n<vma_count && vmas[i+n].end<=end && vmas[i+n].start>=start) {
@@ -454,18 +530,61 @@ static void drop_range(uintptr_t start, uintptr_t end) {
 /* Places a host mapping; with MAP_FIXED it replaces what the guest had there. */
 static int32_t place(void **inout, uint64_t size, int prot, int flags, uint64_t alignment,
                      int kind, int type, uint64_t phys) {
-    uintptr_t address=(uintptr_t)*inout;
-    if (flags & MAP_FIXED_FLAG) {
-        if (!address || address%PAGE) return INVALID;
+    const uintptr_t requested=(uintptr_t)*inout;
+    const int fixed=!!(flags&MAP_FIXED_FLAG);
+    uintptr_t address=requested;
+    if (fixed) {
+        if (!address || address%PAGE || size>UINTPTR_MAX-address) return INVALID;
         if ((flags & MAP_NO_OVERWRITE) && overlaps(address,address+size,1)) return mem_fail(NO_MEMORY, __LINE__);
     } else {
+#ifdef _WIN32
         address=find_free(address,size,alignment);
-        if (!address) return mem_fail(NO_MEMORY, __LINE__);
+#else
+        address=find_free(address>=USER_MIN ? address : NONFIXED_START,size,alignment);
+#endif
     }
-    if (host_map(address,size,host_prot(prot),kind==KIND_RESERVED,phys)) return mem_fail(NO_MEMORY, __LINE__);
+    /* At most two boundary splits and one insertion follow a successful host
+     * mapping. Obtain the metadata capacity first so failure cannot strand a
+     * new mapping or destroy the old VMA description after MAP_FIXED. */
+    if (vma_count>SIZE_MAX-3 || vma_reserve(vma_count+3)) return mem_fail(NO_MEMORY, __LINE__);
+#ifdef _WIN32
+    if (!address) return mem_fail(NO_MEMORY, __LINE__);
+    if (host_map(address,size,host_prot(prot),kind==KIND_RESERVED,phys,fixed)) return mem_fail(NO_MEMORY, __LINE__);
+#else
+    int host_mapped=address && !host_map(address,size,host_prot(prot),kind==KIND_RESERVED,phys,fixed);
+    int error=address ? errno : ENOMEM;
+    if (!host_mapped && !fixed && (error==ENOMEM || error==EINVAL || error==EEXIST)) {
+        /* Only collisions justify rescanning: ENOMEM/EINVAL at the first
+         * fallback candidate must not become a page-by-page VA-width search. */
+        for (unsigned attempt=0;attempt<16;++attempt) {
+            address=find_host_free(size,alignment);
+            if (!address) { error=errno; break; }
+            if (!host_map(address,size,host_prot(prot),kind==KIND_RESERVED,phys,0)) { host_mapped=1; break; }
+            error=errno;
+            if (error!=EEXIST) break;
+        }
+    }
+    if (!host_mapped) {
+        fprintf(stderr,"Runtime: %s guest map failed: hint=0x%" PRIxPTR ", bytes=%" PRIu64
+                ", alignment=0x%" PRIx64 ", errno=%d (%s)\n",
+                fixed ? "fixed" : "non-fixed",requested,size,alignment,error,strerror(error));
+        errno=error;
+        return mem_fail(NO_MEMORY, __LINE__);
+    }
+    if (requested && requested!=address)
+        printf("Runtime: relocated non-fixed mapping: hint=0x%" PRIxPTR " -> address=0x%" PRIxPTR
+               ", bytes=%" PRIu64 ", alignment=0x%" PRIx64 "\n",requested,address,size,alignment);
+#endif
     void *mapped=(void *)address;
     drop_range(address,address+size);
-    if (vma_insert(vma_index(address),(Vma){address,address+size,kind,prot,type,phys})) return mem_fail(NO_MEMORY, __LINE__);
+    Vma region={address,address+size,kind,prot,type,phys,{0}};
+    strcpy(region.name,kind==KIND_RESERVED ? "reserved" : kind==KIND_DIRECT ? "direct" : "flexible");
+    if (vma_insert(vma_index(address),region)) {
+        /* Capacity was reserved above; retain a rollback even if that invariant
+         * changes later. A non-fixed map has replaced no earlier guest VMA. */
+        if (!fixed) host_unmap(address,size);
+        return mem_fail(NO_MEMORY, __LINE__);
+    }
     if (kind==KIND_FLEXIBLE) flexible_bytes+=size;
     if (kind!=KIND_RESERVED) queue_hook(HOOK_MAP,address,size);
     *inout=mapped;
@@ -477,6 +596,7 @@ static int block_type(uint64_t phys) {
     return -1;
 }
 static int direct_range_allocated(uint64_t phys, uint64_t size) {
+    if (phys>POOL_SIZE || size>POOL_SIZE-phys) return 0;
     for (uint64_t at=phys; at<phys+size;) {
         int found=0;
         for (int i=0;i<LIMIT;++i) if (blocks[i].used && at>=blocks[i].start && at-blocks[i].start<blocks[i].size) {
@@ -485,6 +605,45 @@ static int direct_range_allocated(uint64_t phys, uint64_t size) {
         if (!found) return 0;
     }
     return 1;
+}
+
+static ABI int32_t set_prt_aperture(int32_t id, void *base, uint64_t size) {
+    uintptr_t address=(uintptr_t)base;
+    if (id<0 || id>=PRT_APERTURES || address<USER_MIN || address>USER_MAX ||
+        address%4096 || size>USER_MAX-address) return INVALID;
+    pthread_mutex_lock(&prt_mutex);
+    write_lock();
+    PrtAperture previous=prt_apertures[id];
+    prt_apertures[id]=(PrtAperture){address,size};
+    write_unlock();
+    if (previous.address!=address || previous.size!=size) {
+        if (hook_prt) hook_prt((unsigned)id,address,size);
+        printf("Runtime: PRT aperture %d address=0x%" PRIxPTR ", bytes=%" PRIu64
+               " (sparse GPU range; backing mapped separately)\n",id,address,size);
+    }
+    pthread_mutex_unlock(&prt_mutex);
+    return 0;
+}
+static ABI int32_t get_prt_aperture(int32_t id, void **address, uint64_t *size) {
+    if (id<0 || id>=PRT_APERTURES || !address || !size) return INVALID;
+    read_lock();
+    PrtAperture aperture=prt_apertures[id];
+    read_unlock();
+    *address=(void *)aperture.address;
+    *size=aperture.size;
+    return 0;
+}
+void runtime_memory_set_prt_hook(GpuPrtAperture hook) {
+    pthread_mutex_lock(&prt_mutex);
+    hook_prt=hook;
+    if (hook) {
+        PrtAperture snapshot[PRT_APERTURES];
+        read_lock();
+        memcpy(snapshot,prt_apertures,sizeof(snapshot));
+        read_unlock();
+        for (unsigned i=0;i<PRT_APERTURES;++i) hook(i,snapshot[i].address,snapshot[i].size);
+    }
+    pthread_mutex_unlock(&prt_mutex);
 }
 
 static ABI uint64_t direct_size(void) { return POOL_SIZE; }
@@ -539,8 +698,13 @@ static ABI int32_t direct_map_named(void **out, uint64_t size, int prot, int fla
     (void)name; return direct_map(out,size,prot,flags,physical,alignment);
 }
 static int32_t unmap_locked(uintptr_t start, uint64_t size) {
-    if (start%PAGE || !size) return INVALID;
-    uint64_t end=start+align_up(size,PAGE);
+    if (start%PAGE || !size || size>UINT64_MAX-(PAGE-1)) return INVALID;
+    size=align_up(size,PAGE);
+    if (size>UINTPTR_MAX-start) return INVALID;
+    uint64_t end=start+size;
+    /* An interior unmap can split both boundary VMAs. Obtain the metadata
+     * before changing host mappings, just as the map path does. */
+    if (vma_count>SIZE_MAX-2 || vma_reserve(vma_count+2)) return mem_fail(NO_MEMORY,__LINE__);
     for (size_t i=vma_index(start); i<vma_count && vmas[i].start<end; ++i)
         if (vmas[i].kind!=KIND_RESERVED) {
             uintptr_t a=vmas[i].start>start ? vmas[i].start : start, b=vmas[i].end<end ? vmas[i].end : end;
@@ -555,7 +719,9 @@ static int32_t unmap_locked(uintptr_t start, uint64_t size) {
 }
 static ABI int32_t direct_unmap(void *address, uint64_t size) {
     /* The GPU forgets the range before it disappears (as shadPS4's early GPU unmap). */
-    if (hook_unmap && !((uintptr_t)address%PAGE) && size) hook_unmap((uintptr_t)address,align_up(size,PAGE));
+    if ((uintptr_t)address%PAGE || !size || size>UINT64_MAX-(PAGE-1) ||
+        align_up(size,PAGE)>UINTPTR_MAX-(uintptr_t)address) return INVALID;
+    if (hook_unmap) hook_unmap((uintptr_t)address,align_up(size,PAGE));
     write_lock();
     size_t before=pending_count;
     int32_t result=unmap_locked((uintptr_t)address,size);
@@ -563,18 +729,39 @@ static ABI int32_t direct_unmap(void *address, uint64_t size) {
     write_unlock();
     return result;
 }
-static ABI int32_t direct_release(uint64_t start, uint64_t size) {
-    if (start % PAGE || size % PAGE) return INVALID;
-    if (!size) return 0;
-    write_lock();
-    if (!direct_range_allocated(start,size)) { write_unlock(); return INVALID; }
+/* CheckedReleaseDirectMemory validates the complete physical interval before
+ * releasing anything (ENOENT on an unallocated page). The unchecked variant
+ * releases the allocated portions and ignores free/out-of-pool space, matching
+ * shadPS4 MemoryManager::Free's checked/unchecked distinction. */
+static int32_t direct_release_locked(uint64_t start, uint64_t size, int checked) {
+    if (checked && !direct_range_allocated(start,size)) return NOT_FOUND;
+    if (start>=POOL_SIZE) return checked ? NOT_FOUND : 0;
+    if (size>POOL_SIZE-start) size=POOL_SIZE-start;
+    const uint64_t end=start+size;
+    unsigned free_blocks=0, extra_blocks=0;
+    for (int i=0;i<LIMIT;++i) {
+        const Block *b=&blocks[i];
+        if (!b->used) ++free_blocks;
+        else if (b->start<start && end<b->start+b->size) ++extra_blocks;
+    }
+    if (extra_blocks>free_blocks) return mem_fail(NO_MEMORY,__LINE__);
+    size_t aliases=0;
+    for (size_t i=0;i<vma_count;++i) {
+        const Vma *v=&vmas[i];
+        if (v->kind==KIND_DIRECT && v->phys<end && start<v->phys+v->end-v->start) ++aliases;
+    }
+    /* Each partially released alias can leave two edges. Reserve metadata for
+     * every alias before the first unmap, including fragmented physical blocks. */
+    if (aliases>(SIZE_MAX-vma_count)/2 || vma_reserve(vma_count+2*aliases))
+        return mem_fail(NO_MEMORY,__LINE__);
     /* Mappings of released physical pages disappear with them. */
     for (size_t i=0; i<vma_count;) {
         Vma v=vmas[i];
         uint64_t length=v.end-v.start;
-        if (v.kind==KIND_DIRECT && v.phys<start+size && start<v.phys+length) {
-            uint64_t a=v.phys>start ? v.phys : start, b=v.phys+length<start+size ? v.phys+length : start+size;
-            unmap_locked(v.start+(a-v.phys),b-a);
+        if (v.kind==KIND_DIRECT && v.phys<end && start<v.phys+length) {
+            uint64_t a=v.phys>start ? v.phys : start, b=v.phys+length<end ? v.phys+length : end;
+            int32_t result=unmap_locked(v.start+(a-v.phys),b-a);
+            if (result) return result;
             i=vma_index(v.start);
             continue;
         }
@@ -582,8 +769,8 @@ static ABI int32_t direct_release(uint64_t start, uint64_t size) {
     }
     for (int i=0; i<LIMIT; ++i) {
         Block *b=&blocks[i];
-        if (!b->used || b->start>=start+size || start>=b->start+b->size) continue;
-        uint64_t a=b->start>start ? b->start : start, e=b->start+b->size<start+size ? b->start+b->size : start+size;
+        if (!b->used || b->start>=end || start>=b->start+b->size) continue;
+        uint64_t a=b->start>start ? b->start : start, e=b->start+b->size<end ? b->start+b->size : end;
         Block left=*b, right=*b;
         left.size=a-b->start; right.start=e; right.size=b->start+b->size-e;
         b->used=0;
@@ -592,10 +779,19 @@ static ABI int32_t direct_release(uint64_t start, uint64_t size) {
         live_bytes-=e-a;
     }
     host_discard(start,size); /* zero on reuse */
-    write_unlock();
-    flush_hooks();
     return 0;
 }
+static int32_t release_direct(uint64_t start, uint64_t size, int checked) {
+    if (start%PAGE || size%PAGE) return INVALID;
+    if (!size) return 0;
+    write_lock();
+    int32_t result=direct_release_locked(start,size,checked);
+    write_unlock();
+    flush_hooks();
+    return result;
+}
+static ABI int32_t direct_release(uint64_t start, uint64_t size) { return release_direct(start,size,0); }
+static ABI int32_t direct_checked_release(uint64_t start, uint64_t size) { return release_direct(start,size,1); }
 static int32_t map_flexible_locked(void **inout, uint64_t size, int prot, int flags) {
     if (!inout || !size || size%PAGE || (prot & ~0x37)) return INVALID;
     if (flexible_bytes+size>FLEXIBLE_SIZE || pool()) return mem_fail(NO_MEMORY, __LINE__);
@@ -690,6 +886,34 @@ static ABI int32_t query_protection(void *address, void **start, void **end, uin
     read_unlock();
     return 0;
 }
+/* Names are guest metadata, including for memfd-backed direct memory where the
+ * Linux anonymous-VMA naming prctl cannot be used. Keep them on each VMA so
+ * VirtualQuery reports the name after splits, protection changes and unmaps.
+ * The kernel API uses 31 characters plus NUL and PS4 16 KiB range granularity. */
+static ABI int32_t set_virtual_range_name(const void *address, uint64_t size, const char *name) {
+    if (!name) return BAD_ADDRESS;
+    size_t length=strnlen(name,32);
+    if (length>=32) return NAME_TOO_LONG;
+    uintptr_t start=(uintptr_t)address & ~(uintptr_t)(PAGE-1);
+    if (!size || size>UINT64_MAX-(PAGE-1)) return INVALID;
+    size=align_up(size,PAGE);
+    if (start<USER_MIN || start>=USER_MAX || size>USER_MAX-start) return INVALID;
+    uintptr_t end=start+size;
+    write_lock();
+    if (!covered(start,end,1)) { write_unlock(); return INVALID; }
+    int error;
+    size_t i=carve(start,end,&error);
+    if (error) { write_unlock(); return mem_fail(NO_MEMORY, __LINE__); }
+    for (; i<vma_count && vmas[i].start<end; ++i) {
+        memset(vmas[i].name,0,sizeof(vmas[i].name));
+        memcpy(vmas[i].name,name,length);
+    }
+    write_unlock();
+    return 0;
+}
+static ABI int32_t clear_virtual_range_name(const void *address, uint64_t size) {
+    return set_virtual_range_name(address,size,"");
+}
 static ABI int32_t virtual_query(const void *address, int flags, VirtualQueryInfo *info, uint64_t info_size) {
     if (!info || info_size!=sizeof(*info)) return INVALID;
     read_lock();
@@ -701,7 +925,7 @@ static ABI int32_t virtual_query(const void *address, int flags, VirtualQueryInf
     info->offset=v.kind==KIND_DIRECT ? v.phys : 0;
     info->protection=v.prot; info->memory_type=v.type;
     info->flags=(v.kind==KIND_FLEXIBLE ? 1u : 0) | (v.kind==KIND_DIRECT ? 2u : 0) | (v.kind!=KIND_RESERVED ? 16u : 0);
-    strcpy(info->name, v.kind==KIND_RESERVED ? "reserved" : v.kind==KIND_DIRECT ? "direct" : "flexible");
+    memcpy(info->name,v.name,sizeof(info->name));
     __atomic_add_fetch(&queries,1,__ATOMIC_RELAXED);
     read_unlock();
     return 0;
@@ -745,10 +969,13 @@ static const RuntimeExport exports[]={
     {"sceKernelGetDirectMemorySize",direct_size}, {"sceKernelAllocateDirectMemory",direct_allocate},
     {"sceKernelMapDirectMemory",direct_map}, {"sceKernelMapNamedDirectMemory",direct_map_named},
     {"sceKernelReleaseDirectMemory",direct_release}, {"sceKernelMunmap",direct_unmap}, {"munmap",direct_unmap},
+    {"sceKernelCheckedReleaseDirectMemory",direct_checked_release},
+    {"sceKernelSetPrtAperture",set_prt_aperture}, {"sceKernelGetPrtAperture",get_prt_aperture},
     {"sceKernelMapFlexibleMemory",map_flexible}, {"sceKernelMapNamedFlexibleMemory",map_flexible_named},
     {"sceKernelReleaseFlexibleMemory",release_flexible}, {"sceKernelReserveVirtualRange",reserve_range},
     {"sceKernelMprotect",kernel_mprotect}, {"sceKernelQueryMemoryProtection",query_protection},
     {"sceKernelVirtualQuery",virtual_query}, {"sceKernelGetDirectMemoryType",direct_memory_type},
+    {"sceKernelSetVirtualRangeName",set_virtual_range_name}, {"sceKernelClearVirtualRangeName",clear_virtual_range_name},
     {"sceKernelBatchMap",batch_map}, {"sceKernelBatchMap2",batch_map2},
 };
 uintptr_t runtime_memory_resolve(const char *name) {
@@ -757,35 +984,16 @@ uintptr_t runtime_memory_resolve(const char *name) {
     if (nid_match(name, "rTXw65xmLIA#p#J")) return (uintptr_t)direct_allocate;
     if (nid_match(name, "L-Q3LEjIbgA#p#J")) return (uintptr_t)direct_map;
     if (nid_match(name, "MBuItvba6z8#p#J")) return (uintptr_t)direct_release;
+    if (nid_match(name, "hwVSPCmp5tM")) return (uintptr_t)direct_checked_release;
+    if (nid_match(name, "BohYr-F7-is")) return (uintptr_t)set_prt_aperture;
+    if (nid_match(name, "L0v2Go5jOuM")) return (uintptr_t)get_prt_aperture;
     if (nid_match(name, "cQke9UuBQOk#p#J")) return (uintptr_t)direct_unmap;
+    if (nid_match(name, "DGMG3JshrZU")) return (uintptr_t)set_virtual_range_name;
+    if (nid_match(name, "mkgXxsoxWHg")) return (uintptr_t)clear_virtual_range_name;
     return RUNTIME_LOOKUP(exports,name);
 }
-/* Host-owned memory the guest can see (image, stacks, trampolines) lives in
- * [LOW_MIN, USER_MIN): PS4 code packs pointers into 40-bit fields. */
-#define LOW_MIN UINT64_C(0x0800000000)
-static uintptr_t low_next=LOW_MIN;
-void *runtime_low_map(size_t size, int prot) {
-    size=align_up(size,PAGE);
-    write_lock();
-#ifdef _WIN32
-    void *p=NULL;
-    while (!p && low_next+size<=USER_MIN) {
-        p=VirtualAlloc((void *)low_next,size,MEM_RESERVE|MEM_COMMIT,win_prot(prot));
-        low_next+=size+UINT64_C(65536); /* unmapped gap catches overruns; allocation granularity */
-    }
-    write_unlock();
-    return p;
-#else
-    void *p=MAP_FAILED;
-    while (low_next+size<=USER_MIN) {
-        p=mmap((void *)low_next,size,prot,MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED_NOREPLACE,-1,0);
-        low_next+=size+PAGE; /* unmapped gap catches overruns */
-        if (p!=MAP_FAILED) break;
-    }
-    write_unlock();
-    return p==MAP_FAILED ? NULL : p;
-#endif
-}
+/* Host-owned low-address allocations are independent of the PS4 VMA table;
+ * runtime_low_memory.c also supplies them to the standalone FEX ABI test. */
 /* ---- GPU library interface (gpu/shim/bbgpu.cpp) ---- */
 /* Optimizations switched off at run time (diagnostics): the number in the file named by
  * BB_TOGGLE_FILE, re-read every 250 ms. Bits: 1 region cache, 2 fetch shader cache,

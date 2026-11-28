@@ -1,0 +1,46 @@
+plugins {
+    id 'com.android.application' version '8.7.3'
+}
+
+android {
+    buildFeatures { buildConfig true }
+    namespace 'org.driveclub.port'
+    compileSdk 35
+    buildToolsVersion '35.0.0'
+    ndkVersion '29.0.14206865'
+    useLibrary 'android.test.runner', false
+    useLibrary 'android.test.base', false
+    packaging { jniLibs { useLegacyPackaging true } }
+
+    defaultConfig {
+        applicationId 'org.driveclub.port'
+        minSdk 30
+        targetSdk 35
+        versionCode 7
+        versionName '0.7'
+        testInstrumentationRunner 'android.test.InstrumentationTestRunner'
+        buildConfigField 'boolean', 'GAME_RUNTIME', (providers.gradleProperty('launcherTestAbi').getOrElse('arm64-v8a') == 'arm64-v8a').toString()
+        externalNativeBuild { cmake { arguments '-DANDROID_STL=c++_shared', '-DCMAKE_BUILD_TYPE=Release' } }
+        ndk { abiFilters providers.gradleProperty('launcherTestAbi').getOrElse('arm64-v8a') }
+    }
+    externalNativeBuild {
+        cmake {
+            path file('CMakeLists.txt')
+            version '3.31.6'
+        }
+    }
+}
+
+// Ship the same artwork as the desktop launcher from its original source files.
+def artwork = tasks.register('prepareLauncherArtwork', Sync) {
+    into layout.buildDirectory.dir('generated/launcherArt/drawable-nodpi')
+    from('../launcher/assets/backgrounds/page-2.png') { rename { 'garage_cover.png' } }
+    from('../launcher/assets/brand/logo-red.png') { rename { 'driveclub_wordmark.png' } }
+    from('../packaging/appimage/driveclub-recomp.png') { rename { 'driveclub_icon.png' } }
+}
+android.sourceSets.main.res.srcDir(layout.buildDirectory.dir('generated/launcherArt'))
+tasks.named('preBuild').configure { dependsOn artwork }
+
+android.sourceSets.main.assets.srcDir('../patches')
+android.sourceSets.main.assets.srcDir('../out/android-driver/assets')
+android.sourceSets.androidTest.assets.srcDir('../out/pkg-fixtures')

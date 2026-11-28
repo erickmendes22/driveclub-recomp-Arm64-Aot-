@@ -281,13 +281,33 @@ extern "C" void BbStartSampler() {}
 #include <cstdint>
 #include <cstdio>
 #include <dlfcn.h>
+#ifdef __ANDROID__
+#include <unwind.h>
+#else
 #include <execinfo.h>
+#endif
 #include <unistd.h>
 namespace BbStats {
+#ifdef __ANDROID__
+// Bionic deliberately has no execinfo/backtrace API. NDK's unwinder provides
+// the same bounded diagnostic stack without pulling in glibc compatibility.
+static int CaptureBacktrace(void** frames, int capacity) {
+    struct State { void** frames; int capacity; int count; } state{frames, capacity, 0};
+    _Unwind_Backtrace([](_Unwind_Context* context, void* opaque) {
+        auto& s = *static_cast<State*>(opaque);
+        const auto pc = _Unwind_GetIP(context);
+        if (pc && s.count < s.capacity) s.frames[s.count++] = reinterpret_cast<void*>(pc);
+        return s.count == s.capacity ? _URC_END_OF_STACK : _URC_NO_REASON;
+    }, &state);
+    return state.count;
+}
+#else
+static int CaptureBacktrace(void** frames, int capacity) { return backtrace(frames, capacity); }
+#endif
 // Linux: the same report from backtrace(), addresses as module+offset.
 void PipeCheckViolation(const char* what) {
     void* frames[10]{};
-    const int n = backtrace(frames, 10);
+    const int n = CaptureBacktrace(frames, 10);
     std::uint64_t key = reinterpret_cast<std::uintptr_t>(what);
     for (int i = 1; i < n && i < 7; ++i) {
         key = key * 0x9E3779B97F4A7C15ull + reinterpret_cast<std::uintptr_t>(frames[i]);

@@ -20,7 +20,9 @@
 #include <cstdlib>
 #include <mutex>
 
+#ifndef __ANDROID__
 #include <SDL3/SDL.h>
+#endif
 #include "bbport_settings.h"
 #include "bbport_neural_settings.h"
 #include "bbport_safe_start.h"
@@ -148,6 +150,7 @@ void ExitConfirmation(float scale) {
 std::chrono::steady_clock::time_point last_present{};
 float frame_ms_avg = 0.0f;
 
+#ifndef __ANDROID__
 ImGuiKey KeyFromSdl(SDL_Keycode key) {
     switch (key) {
     case SDLK_TAB: return ImGuiKey_Tab;
@@ -198,6 +201,7 @@ float PixelDensity(SDL_WindowID id) {
     const float density = window ? SDL_GetWindowPixelDensity(window) : 1.0f;
     return density > 0.0f ? density : 1.0f;
 }
+#endif
 
 // The game's text dialog: what is typed, and how to finish (keyboard or controller).
 void TextEntryBox() {
@@ -859,6 +863,7 @@ void Shutdown() {
     exit_body=exit_heading=nullptr;
 }
 
+#ifndef __ANDROID__
 void UpdateTextInput(SDL_Window* window) {
     bool want = false;
     {
@@ -873,9 +878,11 @@ void UpdateTextInput(SDL_Window* window) {
         }
     }
 }
+#endif
 
 void RequestMouseCapture(bool capture) { mouse_capture_requested=capture; }
 
+#ifndef __ANDROID__
 void UpdateMouseCapture(SDL_Window* window) {
     // SDL cursor and relative-mode changes belong to the window thread. The
     // input sampler requests its usual mouse-stick mode; a modal overrides it.
@@ -1003,6 +1010,8 @@ bool HandleEvent(const SDL_Event& event) {
         return false;
     }
 }
+
+#endif
 
 bool Visible() {
     return initialized && (runtime_exit_captures() || menu_open || text_entry_active || note_active || trophy_active || BbSettings::Get().show_fps ||
