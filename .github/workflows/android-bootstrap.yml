@@ -89,6 +89,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ninja-build pkg-config
       - uses: actions/cache@v4
+        id: native-dependencies
         with:
           path: |
             out/android-fex
@@ -96,6 +97,8 @@ jobs:
             out/android-gpu/prefix
             out/android-gpu/host
           key: android-bionic-r29-${{ hashFiles('android/tools/fetch-gpu-deps.sh', 'android/tools/build-fex.sh', 'cpu/**') }}
+          restore-keys: |
+            android-bionic-r29-
       - name: Cross-compile Driveclub loader and HLE for Bionic
         run: ANDROID_NDK_HOME="$ANDROID_HOME/ndk/29.0.14206865" android/tools/build-runtime-core.sh
       - uses: actions/cache@v4
@@ -129,6 +132,16 @@ jobs:
             tail -100 out/build-logs/gpu-dependencies.txt
             exit 1
           fi
+      - name: Cache successful native dependencies before the APK link
+        uses: actions/cache/save@v4
+        if: steps.native-dependencies.outputs.cache-hit != 'true'
+        with:
+          path: |
+            out/android-fex
+            out/android-gpu/source
+            out/android-gpu/prefix
+            out/android-gpu/host
+          key: android-bionic-r29-${{ hashFiles('android/tools/fetch-gpu-deps.sh', 'android/tools/build-fex.sh', 'cpu/**') }}
       - name: Test selected Vulkan dispatch and driver switching
         run: bash android/tools/test-vulkan-dispatch.sh
       - name: Test physical mappings and sparse PRT coverage

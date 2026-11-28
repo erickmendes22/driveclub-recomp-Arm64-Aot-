@@ -232,7 +232,7 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
                     // A guard is usable only after it has actually been zeroed.
                     // Do not bind uninitialized memory to every sparse hole.
                     instance.GetDevice().freeMemory(guard_memory);
-                    guard_memory = {};
+                    guard_memory = nullptr;
                 }
             }
         }
