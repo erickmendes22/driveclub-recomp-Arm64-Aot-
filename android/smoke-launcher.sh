@@ -28,10 +28,10 @@ adb shell wm size 1080x2160
 adb shell wm density 420
 "$adb_binary" logcat -v threadtime DriveclubControlsTest:I '*:S' >out/launcher-preview/control-test-phases.txt 2>&1 &
 controls_log_pid=$!
-phase 'Running six Android integration tests (180-second deadline)'
+phase 'Running nine Android integration tests (180-second deadline)'
 timeout --foreground 180s "$adb_binary" shell am instrument -w -r org.driveclub.port.test/android.test.InstrumentationTestRunner \
     | tee out/launcher-preview/instrumentation.txt
-grep -Fq 'OK (6 tests)' out/launcher-preview/instrumentation.txt
+grep -Fq 'OK (9 tests)' out/launcher-preview/instrumentation.txt
 phase 'Opening the game library'
 adb shell am start -W -n org.driveclub.port/.PortActivity
 # Read accessibility labels and tap their bounds independently of screen density.

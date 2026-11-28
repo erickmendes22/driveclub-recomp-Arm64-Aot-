@@ -134,6 +134,15 @@ static int sleep_ns(uint64_t ns) {
 static ABI int32_t kernel_usleep(uint32_t usec) {
     runtime_diag_wait_begin("usleep",usec,__builtin_return_address(0)); sleep_ns((uint64_t)usec*1000); runtime_diag_wait_end(); return 0;
 }
+static ABI int32_t kernel_sleep(uint32_t seconds) {
+    /* Keep the conversion wide: the unsigned seconds ABI must not wrap after
+     * 4294 seconds as a uint32_t microsecond intermediate would. Host-only
+     * signals do not represent delivered guest signals, so sleep_ns resumes. */
+    runtime_diag_wait_begin("sleep",seconds,__builtin_return_address(0));
+    int error=sleep_ns((uint64_t)seconds*UINT64_C(1000000000));
+    runtime_diag_wait_end();
+    return error ? ERR(runtime_guest_errno(error)) : 0;
+}
 static ABI int32_t posix_usleep(uint32_t usec) {
     runtime_diag_wait_begin("usleep",usec,__builtin_return_address(0)); sleep_ns((uint64_t)usec*1000); runtime_diag_wait_end(); return 0;
 }
@@ -278,14 +287,16 @@ static ABI int32_t thread_once(int32_t *once,void (ABI *routine)(void)) {
 static ABI int32_t posix_once(int32_t *once,void (ABI *routine)(void)) { return thread_once(once,routine) ? 22 : 0; }
 #define KEYS 256
 typedef void (ABI *KeyDestructor)(void *);
-static struct { int used; KeyDestructor destructor; } keys[KEYS];
+static struct { int used; KeyDestructor destructor; uint64_t generation; } keys[KEYS];
 static pthread_mutex_t key_lock=PTHREAD_MUTEX_INITIALIZER;
 static _Thread_local void *key_values[KEYS];
+static _Thread_local uint64_t key_generations[KEYS];
 static ABI int32_t key_create(uint32_t *key,KeyDestructor destructor) {
     if (!key) return ERR(22);
     pthread_mutex_lock(&key_lock);
     for (uint32_t i=1;i<KEYS;++i) if (!keys[i].used) {
         keys[i].used=1; keys[i].destructor=destructor;
+        if (!++keys[i].generation) ++keys[i].generation;
         pthread_mutex_unlock(&key_lock);
         *key=i; return 0;
     }
@@ -301,19 +312,36 @@ static ABI int32_t key_delete(uint32_t key) {
     return r;
 }
 static ABI int32_t key_set(uint32_t key,void *value) {
-    if (!key || key>=KEYS || !keys[key].used) return ERR(22);
-    key_values[key]=value; return 0;
+    if (!key || key>=KEYS) return ERR(22);
+    pthread_mutex_lock(&key_lock);
+    if (!keys[key].used) { pthread_mutex_unlock(&key_lock); return ERR(22); }
+    key_values[key]=value;
+    key_generations[key]=keys[key].generation;
+    pthread_mutex_unlock(&key_lock);
+    return 0;
 }
-static ABI void *key_get(uint32_t key) { return key && key<KEYS ? key_values[key] : NULL; }
+static ABI void *key_get(uint32_t key) {
+    if (!key || key>=KEYS) return NULL;
+    pthread_mutex_lock(&key_lock);
+    void *value=keys[key].used && key_generations[key]==keys[key].generation ? key_values[key] : NULL;
+    pthread_mutex_unlock(&key_lock);
+    return value;
+}
 void runtime_thread_keys_cleanup(void) {
     for (int round=0;round<4;++round) {
         int any=0;
         for (uint32_t i=1;i<KEYS;++i) {
+            pthread_mutex_lock(&key_lock);
             void *value=key_values[i];
-            if (!value || !keys[i].used || !keys[i].destructor) continue;
-            key_values[i]=NULL; any=1;
+            KeyDestructor destructor=keys[i].used && key_generations[i]==keys[i].generation ? keys[i].destructor : NULL;
+            /* A deleted/reused key never inherits the old thread's value. */
+            key_values[i]=NULL;
+            pthread_mutex_unlock(&key_lock);
+            if (!value || !destructor) continue;
+            any=1;
             const uint64_t argument=(uint64_t)(uintptr_t)value;
-            guest_cpu_call((uintptr_t)keys[i].destructor,1,&argument);
+            /* The key can be deleted concurrently or by its own destructor. */
+            guest_cpu_call((uintptr_t)destructor,1,&argument);
         }
         if (!any) break;
     }
@@ -325,22 +353,37 @@ static ABI int32_t posix_key_set(uint32_t k,void *v) { int32_t r=key_set(k,v); r
 /* App PRXs (libtbb, logiWheel) are linked into the image offline and started with the game; the game only
  * needs a handle. A module that starts on load (oskGNMm.prx) gets its module_start with the arguments here. */
 static ABI int32_t kernel_load_start_module(const char *path,uint64_t args,const void *argp,uint32_t flags,const void *opt,int32_t *result) {
-    static int32_t next=0x1000;
-    (void)flags;(void)opt;
-    printf("Runtime: sceKernelLoadStartModule(%s) -> handle %d\n",path ? path : "(null)",next);
-    if (!runtime_start_linked_module(path,args,argp,result) && result) *result=0;
-    return next++;
+    if (!path) return ERR(14);
+    if (flags || opt || (args && !argp)) return ERR(22);
+    int32_t handle=runtime_linked_module_handle(path);
+    if (handle<0) return handle;
+    int32_t started=runtime_start_linked_module(path,args,argp,result);
+    if (started<0) return started;
+    if (!started) return ERR(2);
+    printf("Runtime: sceKernelLoadStartModule(%s) -> linked handle %d\n",path,handle);
+    return handle;
+}
+static ABI int32_t kernel_stop_unload_module(int32_t handle,uint64_t args,const void *argp,uint32_t flags,const void *opt,int32_t *result) {
+    (void)result;
+    if (flags || opt || (args && !argp)) return ERR(22);
+    if (!runtime_linked_module_pinned(handle)) return ERR(3);
+    /* The prepared image permanently binds module relocations and does not
+     * retain a module_stop/DT_FINI entry. Keep those bindings valid and report
+     * busy; never claim to have stopped or unloaded code that remains live. */
+    fprintf(stderr,"Runtime: sceKernelStopUnloadModule(%d): EBUSY; module is linked into the active image\n",handle);
+    return ERR(16);
 }
 static ABI int32_t kernel_set_gpo(uint32_t value) { (void)value; return 0; }
 static ABI int32_t kernel_get_gpi(uint32_t index) { (void)index; return 0; }
 static const RuntimeExport exports[]={
     {"sceKernelGetGPI",kernel_get_gpi}, {"sceKernelSetGPO",kernel_set_gpo}, {"sceKernelLoadStartModule",kernel_load_start_module},
+    {"sceKernelStopUnloadModule",kernel_stop_unload_module},
     {"sceKernelClockGettime",kernel_clock_gettime}, {"clock_gettime",posix_clock_gettime},
     {"clock_getres",posix_clock_getres},
     {"sceKernelGetProcessTime",process_time}, {"sceKernelGetProcessTimeCounter",process_time_counter},
     {"sceKernelGetProcessTimeCounterFrequency",process_time_frequency},
     {"sceKernelReadTsc",read_tsc}, {"sceKernelGetTscFrequency",tsc_frequency},
-    {"sceKernelUsleep",kernel_usleep}, {"usleep",posix_usleep}, {"sleep",posix_sleep},
+    {"sceKernelUsleep",kernel_usleep}, {"sceKernelSleep",kernel_sleep}, {"usleep",posix_usleep}, {"sleep",posix_sleep},
     {"nanosleep",posix_nanosleep}, {"sceKernelNanosleep",kernel_nanosleep},
     {"sceKernelGettimezone",kernel_gettimezone}, {"gettimeofday",posix_gettimeofday},
     {"sceKernelGettimeofday",kernel_gettimeofday},

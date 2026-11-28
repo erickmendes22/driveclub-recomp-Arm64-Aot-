@@ -1322,7 +1322,7 @@ void DeregisterNpCallback(std::string key) {
     g_np_callbacks.erase(key);
 }
 
-void RegisterLib(Core::Loader::SymbolsResolver* sym) {
+void Initialize() {
     ASSERT_MSG(Libraries::Kernel::sceKernelGetCompiledSdkVersion(&g_firmware_version) == ORBIS_OK,
                "Failed to get compiled SDK version.");
     g_shadnet_enabled = EmulatorSettings.IsShadNetEnabled();
@@ -1336,7 +1336,9 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
         },
         nullptr);
     Libraries::Np::NpHandler::GetInstance().Initialize();
+}
 
+void RegisterLib(Core::Loader::SymbolsResolver* sym) {
     LIB_FUNCTION("GpLQDNKICac", "libSceNpManager", 1, "libSceNpManager", sceNpCreateRequest);
     LIB_FUNCTION("eiqMCt9UshI", "libSceNpManager", 1, "libSceNpManager", sceNpCreateAsyncRequest);
     LIB_FUNCTION("2rsFmlGWleQ", "libSceNpManager", 1, "libSceNpManager", sceNpCheckNpAvailability);

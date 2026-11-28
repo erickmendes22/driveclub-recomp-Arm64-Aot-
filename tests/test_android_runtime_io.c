@@ -14,6 +14,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <time.h>
+
+typedef struct { int64_t sec, usec; } TestTimeval;
 
 static char root[512],archive[600];
 static int last_provider_fd=-1,provider_opens,provider_resolves;
@@ -53,7 +56,8 @@ int driveclub_android_list(const char *path,char ***out,size_t *count) {
     (*out)[0]=strdup("f:game000.dat"); assert((*out)[0]); *count=1; return 0;
 }
 void driveclub_android_free_list(char **entries,size_t count) {
-    for (size_t i=0;i<count;++i) free(entries[i]); free(entries);
+    for (size_t i=0;i<count;++i) free(entries[i]);
+    free(entries);
 }
 int driveclub_android_resolve(const char *path,char *out,size_t size) {
     ++provider_resolves;
@@ -73,6 +77,16 @@ static void test_provider_io(void) {
     runtime_file_configure("/metadata-only",user);
 
     int game=(int)runtime_file_open("/app0/game000.dat",0,0); assert(game>=3);
+    int64_t (ABI *sce_futimes)(int,const TestTimeval *)=(void *)runtime_file_resolve("sceKernelFutimes");
+    int64_t (ABI *posix_futimes)(int,const TestTimeval *)=(void *)runtime_file_resolve("futimes");
+    assert(sce_futimes && posix_futimes);
+    const TestTimeval times[]={{1700000000,123456},{1700000100,654321}};
+    struct stat archive_before,archive_after;
+    assert(!stat(archive,&archive_before));
+    assert(sce_futimes(game,times)==(int32_t)UINT32_C(0x8002001e));
+    assert(!stat(archive,&archive_after));
+    assert(archive_before.st_mtim.tv_sec==archive_after.st_mtim.tv_sec
+            && archive_before.st_mtim.tv_nsec==archive_after.st_mtim.tv_nsec);
     char bytes[10]={0};
     assert(runtime_file_pread(game,bytes,9,offset)==9);
     assert(!strcmp(bytes,"DRIVECLUB"));
@@ -100,8 +114,23 @@ static void test_provider_io(void) {
     }
     assert(found==1); assert(runtime_file_close(dir)==0);
     int save=(int)runtime_file_open("/data/save.bin",0x202,0600); assert(save>=3);
-    assert(runtime_file_write(save,"save",4)==4); assert(runtime_file_close(save)==0);
-    char save_path[700]; snprintf(save_path,sizeof(save_path),"%s/data/save.bin",user); unlink(save_path);
+    assert(runtime_file_write(save,"save",4)==4);
+    char save_path[700]; snprintf(save_path,sizeof(save_path),"%s/data/save.bin",user);
+    assert(sce_futimes(save,times)==0);
+    struct stat saved;
+    assert(!stat(save_path,&saved));
+    assert(saved.st_atim.tv_sec==times[0].sec && saved.st_atim.tv_nsec==times[0].usec*1000);
+    assert(saved.st_mtim.tv_sec==times[1].sec && saved.st_mtim.tv_nsec==times[1].usec*1000);
+    TestTimeval invalid[]={{1,1000000},{2,0}};
+    assert(sce_futimes(save,invalid)==(int32_t)UINT32_C(0x80020016));
+    assert(posix_futimes(save,invalid)==-1 && guest_errno==EINVAL);
+    assert(!stat(save_path,&saved) && saved.st_mtim.tv_sec==times[1].sec);
+    time_t before=time(NULL);
+    assert(sce_futimes(save,NULL)==0);
+    assert(!stat(save_path,&saved) && saved.st_mtim.tv_sec>=before && saved.st_mtim.tv_sec<=time(NULL));
+    assert(runtime_file_close(save)==0);
+    assert(sce_futimes(save,times)==(int32_t)UINT32_C(0x80020009));
+    unlink(save_path);
     snprintf(save_path,sizeof(save_path),"%s/data",user); rmdir(save_path);
     snprintf(save_path,sizeof(save_path),"%s/download0",user); rmdir(save_path);
     snprintf(save_path,sizeof(save_path),"%s/temp0",user); rmdir(save_path);
@@ -129,6 +158,6 @@ static void test_pad(void) {
 }
 int main(void) {
     test_provider_io(); test_pad();
-    puts("Android runtime IO passed: 64-bit archive reads, FD ownership, read-only trees, directories, saves and controller state.");
+    puts("Android runtime IO passed: 64-bit archive reads, FD ownership, read-only trees, directories, saves, futimes and controller state.");
     return 0;
 }

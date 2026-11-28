@@ -23,6 +23,7 @@
 #endif
 #ifdef _WIN32
 #include <windows.h>
+#include <sys/utime.h>
 /* 64-bit sizes and times; directories are never opened as CRT descriptors. */
 typedef struct _stat64 HostStat;
 #define host_stat(path,s) _stat64(path,s)
@@ -30,6 +31,7 @@ typedef struct _stat64 HostStat;
 #define host_lseek _lseeki64
 #define O_DIRECTORY 0x40000000 /* bbport marker, removed before _open */
 #else
+#include <sys/time.h>
 typedef struct stat HostStat;
 #define host_stat(path,s) stat(path,s)
 #define host_fstat(fd,s) fstat(fd,s)
@@ -40,6 +42,7 @@ typedef struct stat HostStat;
 #define MAX_MOUNTS 16
 
 typedef struct { int64_t sec, nsec; } GuestTimespec;
+typedef struct { int64_t sec, usec; } GuestTimeval;
 typedef struct {
     uint32_t dev, ino;
     uint16_t mode, nlink;
@@ -525,6 +528,52 @@ static int host_fd(int fd) {
     File *f=get(fd);
     return f ? f->host : -1;
 }
+static int64_t do_futimes(int fd,const GuestTimeval *times) {
+    GuestTimeval value[2];
+    if (times) {
+        memcpy(value,times,sizeof(value));
+        if (value[0].usec<0 || value[0].usec>=1000000 || value[1].usec<0 || value[1].usec>=1000000)
+            return -EINVAL;
+    }
+    /* Hold the descriptor table across the host operation so a concurrent
+     * guest close cannot reuse this host fd for a different file. Game trees
+     * remain read-only, including provider descriptors opened through SAF. */
+    pthread_mutex_lock(&lock);
+    File *file=get(fd);
+    if (!file) { pthread_mutex_unlock(&lock); return -EBADF; }
+    if (game_path(file->path)) { pthread_mutex_unlock(&lock); return -EROFS; }
+    int result;
+#ifdef _WIN32
+    struct __utimbuf64 converted;
+    if (times) { converted.actime=value[0].sec; converted.modtime=value[1].sec; }
+    if (file->host>=0) result=_futime64(file->host,times ? &converted : NULL);
+    else {
+        /* Windows directory entries have no CRT fd. Snapshot the guest path
+         * before translate takes the same mount/table lock. */
+        char guest[sizeof(file->path)];
+        memcpy(guest,file->path,sizeof(guest));
+        pthread_mutex_unlock(&lock);
+        char path[1024];
+        int error=translate(guest,path,sizeof(path));
+        if (error) return -error;
+        result=_utime64(path,times ? &converted : NULL);
+        return result ? -errno : 0;
+    }
+#else
+    struct timeval converted[2];
+    if (times) {
+        for (unsigned i=0;i<2;++i) {
+            converted[i].tv_sec=(time_t)value[i].sec;
+            converted[i].tv_usec=(suseconds_t)value[i].usec;
+        }
+    }
+    if (file->host<0) { pthread_mutex_unlock(&lock); return -EBADF; }
+    result=futimes(file->host,times ? converted : NULL);
+#endif
+    const int error=result ? errno : 0;
+    pthread_mutex_unlock(&lock);
+    return error ? -error : 0;
+}
 #ifdef _WIN32
 /* The CRT reads and writes at most INT_MAX bytes per call. */
 static ssize_t host_read(int h,void *buffer,uint64_t size) { return read(h,buffer,(unsigned)(size>0x7ffff000 ? 0x7ffff000 : size)); }
@@ -778,6 +827,7 @@ PAIR(rename,(const char *a,const char *b),(a,b))
 PAIR(ftruncate,(int fd,int64_t l),(fd,l))
 PAIR(truncate,(const char *p,int64_t l),(p,l))
 PAIR(fsync,(int fd),(fd))
+PAIR(futimes,(int fd,const GuestTimeval *times),(fd,times))
 static ABI int64_t posix_access(const char *p,int m) { return posix(do_access(p,m)); }
 static ABI int64_t sce_getdents_orbis(int fd,char *b,uint64_t n) { return sce(do_getdents_orbis(fd,b,n)); }
 static ABI int64_t sce_mkdir(const char *p,int m) { return sce(path_op(p,0,m)); }
@@ -806,6 +856,7 @@ static const RuntimeExport exports[]={
     {"sceKernelFtruncate",sce_ftruncate}, {"ftruncate",posix_ftruncate},
     {"sceKernelTruncate",sce_truncate}, {"truncate",posix_truncate},
     {"sceKernelFsync",sce_fsync}, {"fsync",posix_fsync},
+    {"sceKernelFutimes",sce_futimes}, {"futimes",posix_futimes},
     {"access",posix_access}, {"sceKernelCheckReachability",sce_check_reachability},
     {"sceKernelMkdir",sce_mkdir}, {"mkdir",posix_mkdir},
     {"sceKernelRmdir",sce_rmdir}, {"rmdir",posix_rmdir},

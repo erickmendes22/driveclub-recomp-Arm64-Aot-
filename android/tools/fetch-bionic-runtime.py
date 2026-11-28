@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import struct
 import subprocess
@@ -33,6 +34,7 @@ FILES = {
     "system/lib64/libdl_android.so": "/lib64/bionic/libdl_android.so",
     "system/lib64/libm.so": "/lib64/bionic/libm.so",
 }
+PLATFORM_ROOTS = ("libandroid.so", "liblog.so", "libaaudio.so", "libz.so")
 SECTOR = 512
 
 
@@ -49,13 +51,21 @@ def digest(path: Path, algorithm: str = "sha256") -> str:
     return value.hexdigest()
 
 
-def verified_output(path: Path) -> bool:
+def verified_output(path: Path, platform_libraries: bool = False) -> bool:
     try:
         metadata = json.loads((path / "bionic-runtime.json").read_text())
+        expected = set(FILES)
+        if platform_libraries:
+            expected.update("system/lib64/" + name for name in PLATFORM_ROOTS)
+        actual = set(metadata["files"])
         return (metadata["source_sha256"] == SOURCE_SHA256
-                and set(metadata["files"]) == set(FILES)
+                and metadata.get("platform_libraries", False) == platform_libraries
+                and (expected <= actual if platform_libraries else expected == actual)
+                and all(Path(name).parts[:2] == ("system", "lib64") or name == "system/bin/linker64"
+                        for name in actual)
+                and all((path / name).resolve().is_relative_to(path.resolve()) for name in actual)
                 and all(digest(path / name) == metadata["files"][name]
-                        for name in FILES))
+                        for name in actual))
     except (OSError, ValueError, KeyError, TypeError):
         return False
 
@@ -180,14 +190,118 @@ def dump(debugfs: str, image: Path, source: str, target: Path) -> None:
             f"debugfs could not extract {source}: {result.stderr.strip()}")
 
 
+def elf_needed(path: Path) -> list[str]:
+    """Read DT_NEEDED from actual image libraries; no host readelf is needed."""
+    data = path.read_bytes()
+    require(len(data) >= 64 and data[:7] == b"\x7fELF\x02\x01\x01"
+            and struct.unpack_from("<H", data, 18)[0] == 183, f"Not AArch64 ELF: {path.name}")
+    phoff = struct.unpack_from("<Q", data, 32)[0]
+    entsize, count = struct.unpack_from("<HH", data, 54)
+    require(entsize == 56 and 0 < count < 4096 and phoff + count * entsize <= len(data),
+            f"Invalid ELF program headers: {path.name}")
+    segments = [struct.unpack_from("<IIQQQQQQ", data, phoff + index * entsize) for index in range(count)]
+    dynamic = [entry for entry in segments if entry[0] == 2]
+    require(len(dynamic) == 1, f"Invalid ELF dynamic section: {path.name}")
+    offset, size = dynamic[0][2], dynamic[0][5]
+    require(offset + size <= len(data) and size % 16 == 0, "Truncated dynamic section")
+    tags: dict[int, list[int]] = {}
+    for pos in range(offset, offset + size, 16):
+        tag, value = struct.unpack_from("<qQ", data, pos)
+        if tag == 0:
+            break
+        tags.setdefault(tag, []).append(value)
+    if 1 not in tags:
+        return []
+    require(5 in tags and 10 in tags, "Missing ELF dynamic strings")
+    address, length = tags[5][0], tags[10][0]
+    strings = None
+    for kind, _, off, base, _, filesz, _, _ in segments:
+        if kind == 1 and base <= address and address - base + length <= filesz:
+            require(off + address - base + length <= len(data), "Truncated dynamic strings")
+            strings = data[off + address - base:off + address - base + length]
+            break
+    require(strings is not None, "Unmapped dynamic strings")
+    result = []
+    for index in tags[1]:
+        require(index < len(strings), "Invalid DT_NEEDED string offset")
+        end = strings.find(b"\0", index)
+        require(end >= 0, "Unterminated DT_NEEDED string")
+        name = strings[index:end].decode("ascii")
+        require(re.fullmatch(r"[A-Za-z0-9_+@.\-]+\.so", name) is not None,
+                f"Unsupported Android dependency name: {name!r}")
+        result.append(name)
+    return result
+
+
+def extract_platform(debugfs: str, system: Path, temp: Path, result: Path) -> dict[str, str]:
+    """Resolve the NDK platform libraries from the same pinned Android image.
+
+    The real transitive dependencies are included, including runtime/ART/media
+    APEX files when necessary. These are test-only system files, never APK
+    substitutes or generated success stubs.
+    """
+    listing = subprocess.run([debugfs, "-R", "ls -p /system/apex", str(system)],
+                             text=True, capture_output=True, check=True)
+    apex_names = sorted({parts[5] for line in listing.stdout.splitlines()
+                         if len(parts := line.split("/")) > 6
+                         and re.fullmatch(r"[A-Za-z0-9_.\-]+\.apex", parts[5])})
+    apex_images: dict[str, Path] = {}
+
+    def try_library(image: Path, internal: str, target: Path) -> bool:
+        try:
+            dump(debugfs, image, internal, target)
+            elf_needed(target)
+            return True
+        except RuntimeError:
+            target.unlink(missing_ok=True)
+            return False
+
+    def apex_image(name: str) -> Path:
+        if name not in apex_images:
+            archive, payload = temp / name, temp / (name + ".ext4")
+            dump(debugfs, system, "/system/apex/" + name, archive)
+            with zipfile.ZipFile(archive) as package, package.open("apex_payload.img") as source, payload.open("wb") as target:
+                shutil.copyfileobj(source, target)
+            archive.unlink()
+            apex_images[name] = payload
+        return apex_images[name]
+
+    pending = list(PLATFORM_ROOTS)
+    sources: dict[str, str] = {}
+    visited = set()
+    while pending:
+        name = pending.pop()
+        if name in visited:
+            continue
+        visited.add(name)
+        require(len(visited) <= 512, "Unexpected platform dependency closure size")
+        relative = "system/lib64/" + name
+        target = result / relative
+        if not target.is_file():
+            if try_library(system, "/system/lib64/" + name, target):
+                sources[relative] = "/system/lib64/" + name
+            else:
+                for apex_name in apex_names:
+                    if try_library(apex_image(apex_name), "/lib64/" + name, target):
+                        sources[relative] = "/system/apex/" + apex_name + ":/lib64/" + name
+                        break
+                else:
+                    raise RuntimeError(f"The pinned Android image is missing platform dependency {name}")
+        pending.extend(elf_needed(target))
+    print(f"Extracted actual Android platform dependency closure: {len(visited)} libraries", flush=True)
+    return sources
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--cache-dir", type=Path, help="Retain the verified Google archive for future runs")
+    parser.add_argument("--platform-libraries", action="store_true",
+                        help="Also extract real NDK platform dependencies for a linked APK resolver test")
     parser.add_argument("--debugfs", default=shutil.which("debugfs"), help="Path to debugfs from e2fsprogs")
     args = parser.parse_args()
     output = args.output.resolve()
-    if verified_output(output):
+    if verified_output(output, args.platform_libraries):
         print(f"Verified cached official API 30 Bionic runtime: {output}")
         return 0
     require(args.debugfs, "debugfs is required; install e2fsprogs or pass --debugfs /path/to/debugfs")
@@ -209,7 +323,6 @@ def main() -> int:
         disk.unlink()
         apex = temp / "runtime.apex"
         dump(debugfs, system, "/system/apex/com.android.runtime.apex", apex)
-        system.unlink()
         payload = temp / "runtime.ext4"
         with zipfile.ZipFile(apex) as package, package.open("apex_payload.img") as source, payload.open("wb") as target:
             shutil.copyfileobj(source, target)
@@ -219,19 +332,25 @@ def main() -> int:
             dump(debugfs, payload, internal, target)
             require(target.read_bytes()[:6] == b"\x7fELF\x02\x01", f"Not an ELF64 runtime file: {relative}")
             files[relative] = digest(target)
+        platform_sources = {}
+        if args.platform_libraries:
+            platform_sources = extract_platform(debugfs, system, temp, temp / "result")
+            for target in sorted((temp / "result/system/lib64").glob("*.so")):
+                files[str(target.relative_to(temp / "result"))] = digest(target)
         (temp / "result/system/bin/linker64").chmod(0o755)
         metadata = {
             "android_api": 30, "abi": "arm64-v8a", "source_url": SOURCE_URL,
             "source_sha256": SOURCE_SHA256, "google_repository_sha1": SOURCE_SHA1,
-            "purpose": "CPU test runtime only; never packaged in the APK", "files": files,
+            "purpose": "CPU/import test runtime only; never packaged in the APK", "files": files,
+            "platform_libraries": args.platform_libraries, "platform_sources": platform_sources,
         }
         output.mkdir(parents=True, exist_ok=True)
-        for relative in FILES:
+        for relative in files:
             destination = output / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(temp / "result" / relative, destination)
         (output / "bionic-runtime.json").write_text(json.dumps(metadata, indent=2) + "\n")
-    require(verified_output(output), "Extracted runtime verification failed")
+    require(verified_output(output, args.platform_libraries), "Extracted runtime verification failed")
     print(f"Official API 30 ARM64 Bionic runtime ready: {output}")
     return 0
 

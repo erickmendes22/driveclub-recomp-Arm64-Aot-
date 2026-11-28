@@ -26,10 +26,12 @@ import java.nio.file.StandardCopyOption;
 
 /** Owns the game's native process. Guest exit/crash never takes down the garage. */
 public final class GameActivity extends Activity implements SurfaceHolder.Callback {
-    private static native int runNative(String preparedDir, String userDir, String logPath,
+    private native int runNative(String preparedDir, String userDir, String logPath,
                                         RuntimeFiles files, Surface surface);
     private static native void inputNative(int buttons, float lx, float ly, float rx, float ry, float l2, float r2);
-    private boolean started, loaded, ending;
+    private boolean started, loaded;
+    private volatile boolean ending;
+    private ScreenshotPolicy screenshotPolicy;
     private PortLog log;
     private RuntimeFiles files;
     private RacingControls controls;
@@ -41,6 +43,7 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
         log = new PortLog(this);
+        screenshotPolicy = new ScreenshotPolicy(this, () -> ending);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         getWindow().setDecorFitsSystemWindows(false);
         FrameLayout root = new FrameLayout(this);
@@ -86,6 +89,12 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
             Toast.makeText(this, "Falha ao carregar o runtime. Consulte os logs.", Toast.LENGTH_LONG).show();
             endRuntime("Falha ao carregar o runtime");
         }
+    }
+
+    /** Called by the native capture-policy hook, including from guest worker threads. */
+    @SuppressWarnings("unused")
+    private boolean applyScreenshotPolicy(boolean enabled) {
+        return screenshotPolicy != null && screenshotPolicy.apply(enabled);
     }
 
     private int dp(int value) { return Math.round(value * getResources().getDisplayMetrics().density); }

@@ -150,10 +150,13 @@ void runtime_thread_attach_main(void) {
     snprintf(t->name,sizeof(t->name),"main");
     runtime_diag_name("main");
 }
+static GuestThread *find_thread_locked(void *handle) {
+    for (GuestThread *t=threads;t;t=t->next) if (t==handle) return t;
+    return NULL;
+}
 static GuestThread *find_thread(void *handle) {
-    GuestThread *found=NULL;
     pthread_mutex_lock(&lock);
-    for (GuestThread *t=threads;t;t=t->next) if (t==handle) { found=t; break; }
+    GuestThread *found=find_thread_locked(handle);
     pthread_mutex_unlock(&lock);
     return found;
 }
@@ -279,6 +282,11 @@ __thread int runtime_thread_background;
 static int is_background_name(const char *n) {
     return strstr(n,"WebAPI") || strstr(n,"TM_FFB") || strstr(n,"tm_ffb") || strstr(n,"logiwheel") || strstr(n,"NpWebApi");
 }
+void runtime_thread_cleanup(void) {
+    /* Destructors may still call __tls_get_addr or register another key. */
+    runtime_thread_keys_cleanup();
+    runtime_tls_cleanup();
+}
 static void *host_start(void *p) {
     GuestThread *t=p;
     attach(t);
@@ -294,10 +302,16 @@ static void *host_start(void *p) {
     const uint64_t argument=(uint64_t)(uintptr_t)t->argument;
     if (!exit_setjmp(t)) t->result=(void *)(uintptr_t)guest_cpu_call((uintptr_t)t->entry,1,&argument);
     else guest_cpu_abandon();
-    runtime_thread_keys_cleanup();
+    runtime_thread_cleanup();
 #ifndef _WIN32
     guest_cpu_thread_end();
 #endif
+    /* FEX no longer references this separate guest stack. The pthread's own
+     * active stack is different and must never be unmapped from here. */
+    if (t->guest_stack) {
+        if (runtime_low_unmap(t->guest_stack,t->guest_stack_size)) perror("Cannot release guest thread stack");
+        else { t->guest_stack=NULL; t->guest_stack_size=0; }
+    }
     pthread_mutex_lock(&lock); t->finished=1; ++exited; pthread_mutex_unlock(&lock);
     return t->result;
 }
@@ -312,6 +326,7 @@ static int32_t create(GuestThread **out,ThreadAttr **attr_slot,GuestEntry entry,
     snprintf(t->name,sizeof(t->name),"%s",name ? name : "guest");
     pthread_attr_t host;
     pthread_attr_init(&host);
+    if (t->detached) pthread_attr_setdetachstate(&host,PTHREAD_CREATE_DETACHED);
     uint64_t stack=t->attr.stack<MIN_STACK ? MIN_STACK : t->attr.stack;
     /* Stacks below 1 TiB as on PS4; guest code may pack stack addresses. */
     size_t stack_bytes=(size_t)stack+STACK_MARGIN;
@@ -330,14 +345,17 @@ static int32_t create(GuestThread **out,ThreadAttr **attr_slot,GuestEntry entry,
     t->guest_stack_size=(size_t)stack;
 #endif
 #endif
-    publish(t);
-    /* Publish the handle before the thread can run and inspect itself. */
+    /* A new guest can immediately detach itself. Hold the table lock until
+     * pthread_create has stored the host handle, so detach/join cannot race
+     * that publication, including a different guest observing *out. */
+    pthread_mutex_lock(&lock);
+    t->next=threads; threads=t;
     *out=t;
     int e=pthread_create(&t->host,&host,host_start,t);
+    if (!e) ++created;
+    pthread_mutex_unlock(&lock);
     pthread_attr_destroy(&host);
     if (e) { fprintf(stderr,"STOP: host pthread_create failed: %d\n",e); exit(21); }
-    if (t->detached) pthread_detach(t->host);
-    pthread_mutex_lock(&lock); ++created; pthread_mutex_unlock(&lock);
     printf("Runtime: guest thread '%s' created (stack=%llu, prio=%d)\n",t->name,(unsigned long long)stack,t->attr.prio);
     return 0;
 }
@@ -345,25 +363,37 @@ static ABI int32_t thread_create(GuestThread **out,ThreadAttr **attr,GuestEntry 
     return create(out,attr,entry,argument,name);
 }
 static ABI int32_t thread_join(GuestThread *t,void **result) {
-    if (!find_thread(t) || t->host_owned) return ERR(3);
-    if (t==current) return ERR(11);
-    if (t->detached || t->joined) return ERR(22);
+    pthread_mutex_lock(&lock);
+    if (!find_thread_locked(t) || t->host_owned) { pthread_mutex_unlock(&lock); return ERR(3); }
+    if (t==current) { pthread_mutex_unlock(&lock); return ERR(11); }
+    if (t->detached || t->joined) { pthread_mutex_unlock(&lock); return ERR(22); }
     t->joined=1;
+    pthread_mutex_unlock(&lock);
     void *value=NULL;
     runtime_diag_wait_begin("join",(uint64_t)(uintptr_t)t,__builtin_return_address(0));
     int e=pthread_join(t->host,&value);
     runtime_diag_wait_end();
-    if (e) { fprintf(stderr,"STOP: host pthread_join failed: %d\n",e); exit(21); }
+    if (e) {
+        pthread_mutex_lock(&lock); t->joined=0; pthread_mutex_unlock(&lock);
+        return ERR(runtime_guest_errno(e));
+    }
     if (result) *result=t->result;
     pthread_mutex_lock(&lock); ++joined_count; pthread_mutex_unlock(&lock);
     return 0;
 }
 static ABI int32_t thread_detach(GuestThread *t) {
-    if (!find_thread(t)) return ERR(3);
-    if (t->detached) return ERR(22);
-    t->detached=1;
-    if (!t->host_owned) pthread_detach(t->host);
-    return 0;
+    pthread_mutex_lock(&lock);
+    if (!find_thread_locked(t)) { pthread_mutex_unlock(&lock); return ERR(3); }
+    /* A decoder/JVM/main thread belongs to its host creator and is not
+     * joinable through this guest API. Never detach that host resource. */
+    if (t->host_owned) { pthread_mutex_unlock(&lock); return ERR(22); }
+    if (t->detached || t->joined) { pthread_mutex_unlock(&lock); return ERR(22); }
+    /* Claim detach against join while holding the thread table lock. Publish
+     * the detached state only after the host accepts the transition. */
+    int e=pthread_detach(t->host);
+    if (!e) t->detached=1;
+    pthread_mutex_unlock(&lock);
+    return e ? ERR(runtime_guest_errno(e)) : 0;
 }
 static ABI __attribute__((noreturn)) void thread_exit(void *value) {
     GuestThread *t=runtime_thread_current();
@@ -408,6 +438,7 @@ static ABI int32_t posix_attr_set_detach(ThreadAttr **a,int s) { return posix(at
 static ABI int32_t posix_attr_set_stack(ThreadAttr **a,uint64_t s) { return posix(attr_set_stack(a,s)); }
 static ABI int32_t posix_attr_set_param(ThreadAttr **a,const int *p) { return posix(attr_set_param(a,p)); }
 static ABI int32_t posix_create(GuestThread **t,ThreadAttr **a,GuestEntry e,void *arg) { return posix(create(t,a,e,arg,"posix")); }
+static ABI int32_t posix_detach(GuestThread *t) { return posix(thread_detach(t)); }
 static ABI int32_t posix_create_name(GuestThread **t,ThreadAttr **a,GuestEntry e,void *arg,const char *name) { return posix(create(t,a,e,arg,name)); }
 static ABI int32_t posix_join(GuestThread *t,void **r) { return posix(thread_join(t,r)); }
 
@@ -450,6 +481,7 @@ uintptr_t runtime_thread_resolve(const char *name) {
         {"E+tyo3lp5Lw#I#J",posix_attr_set_detach}, {"2Q0z6rnBrTE#I#J",posix_attr_set_stack},
         {"euKRgm0Vn2M#I#J",posix_attr_set_param}, {"OxhIB8LB-PQ#I#J",posix_create},
         {"Jmi+9w9u0E4#I#J",posix_create_name}, {"h9CcP3J0oVM#I#J",posix_join},
+        {"+U1R4WtXvoc",posix_detach},
         {"FJrT5LuUBAU#I#J",thread_exit},
     };
     for (size_t i=0;i<sizeof(table)/sizeof(*table);++i)

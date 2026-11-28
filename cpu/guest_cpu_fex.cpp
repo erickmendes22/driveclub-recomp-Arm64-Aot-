@@ -3,6 +3,7 @@
 // guest CPU state. Host functions are reached from the guest through stubs that end in `syscall`
 // (dispatched by HandleSyscall below); guest functions are called with Context::HandleCallback.
 #include "guest_cpu.h"
+#include "guest_setcontext_code.h"
 
 #include <Common/Config.h>
 #include <Common/HostFeatures.h>
@@ -63,6 +64,12 @@ using FEXCore::Core::InternalThreadState;
 [[noreturn]] void Fatal(const char* message, uint64_t a = 0, uint64_t b = 0) {
     std::fprintf(stderr, "STOP: guest CPU: %s (%#llx, %#llx)\n", message, (unsigned long long)a, (unsigned long long)b);
     std::fflush(nullptr);
+    _exit(21);
+}
+[[noreturn]] void InvalidLibunwindContext(const void* context,uint64_t reason) {
+    std::fprintf(stderr,"STOP: invalid __Ux86_64_setcontext at %p (reason %llu: 1 pointer/alignment, 2 mc_len, 3 RIP/RSP, 4 FP owner, 5 FP format)\n",
+                 context,static_cast<unsigned long long>(reason));
+    std::fflush(stderr);
     _exit(21);
 }
 
@@ -306,6 +313,9 @@ uint64_t ReadGuest(uintptr_t address) {
 } // namespace
 
 extern "C" {
+int guest_cpu_libunwind_setcontext(const void* context) {
+    InvalidLibunwindContext(context,0); // Only callable through its guest restore entry.
+}
 void guest_cpu_init(void* (*map)(size_t size, int prot)) {
     low_map = map;
     const long page_size = sysconf(_SC_PAGESIZE);
@@ -365,19 +375,30 @@ void guest_cpu_code(uintptr_t base, size_t size) {
 }
 
 uintptr_t guest_cpu_host_function(void* fn) {
+    // The libunwind ABI restores an x86 context and transfers to its saved RIP,
+    // not a normal host-call result. Execute the restore instructions as guest
+    // code so FEX handles the stack switch, GPRs, x87 and SSE itself.
+    const bool restore=fn==reinterpret_cast<void*>(guest_cpu_libunwind_setcontext);
+    const uintptr_t failure=restore ? guest_cpu_host_function(reinterpret_cast<void*>(InvalidLibunwindContext)) : 0;
     std::lock_guard lock(stub_lock);
     if (auto found = stub_of.find(fn); found != stub_of.end()) {
         return found->second;
     }
     const size_t index = stub_count.load(std::memory_order_relaxed);
-    if (index >= StubBytes / StubSize) {
+    const size_t slots=restore ? (sizeof(guest_setcontext_code)+StubSize-1)/StubSize : 1;
+    if (index > StubBytes / StubSize || slots>StubBytes / StubSize-index) {
         Fatal("too many host functions");
     }
     unsigned char* stub = stubs + index * StubSize;
-    static constexpr unsigned char code[] = {0x49, 0x89, 0xca, 0x0f, 0x05, 0xc3}; // mov r10, rcx; syscall; ret
-    stub_functions[index] = fn;
-    std::memcpy(stub, code, sizeof(code));
-    stub_count.store(index + 1, std::memory_order_release);
+    if (restore) {
+        std::memcpy(stub,guest_setcontext_code,sizeof(guest_setcontext_code));
+        std::memcpy(stub+GUEST_SETCONTEXT_FAILURE_OFFSET,&failure,sizeof(failure));
+    } else {
+        static constexpr unsigned char code[] = {0x49, 0x89, 0xca, 0x0f, 0x05, 0xc3}; // mov r10, rcx; syscall; ret
+        stub_functions[index] = fn;
+        std::memcpy(stub, code, sizeof(code));
+    }
+    stub_count.store(index + slots, std::memory_order_release);
     const auto address = reinterpret_cast<uintptr_t>(stub);
     stub_of.emplace(fn, address);
     return address;

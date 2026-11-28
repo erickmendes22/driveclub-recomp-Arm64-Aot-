@@ -10,6 +10,21 @@ on:
       - 'tests/test_android_fex.cpp'
       - 'tests/test_android_runtime_io.c'
       - 'tests/test_runtime_memory.c'
+      - 'tests/test_runtime_services.c'
+      - 'tests/test_runtime_usbd.c'
+      - 'tests/test_runtime_thread_contracts.c'
+      - 'tests/test_runtime_modules.c'
+      - 'tests/test_runtime_capture.c'
+      - 'tests/test_guest_setcontext.c'
+      - 'tests/guest_setcontext*'
+      - 'tests/test_image_codecs.cpp'
+      - 'tests/test_import_audit.py'
+      - 'tests/test_android_imports.cpp'
+      - 'tests/test_gpu_mapped_ranges.cpp'
+      - 'tests/fixtures/**'
+      - 'tools/audit-imports.py'
+      - 'tools/generate-setcontext.py'
+      - 'tools/generate-provider-cases.py'
       - 'launcher/prepare.*'
       - 'tests/test_update_metadata.cpp'
       - '.github/workflows/android-bootstrap.yml'
@@ -31,6 +46,37 @@ jobs:
           /tmp/test-android-io
           cc -std=c11 -O2 -ffunction-sections -fdata-sections -pthread tests/test_runtime_memory.c -Wl,--gc-sections -o /tmp/test-runtime-memory
           /tmp/test-runtime-memory
+      - name: Test service, content, dialog, RTC and USB contracts
+        run: |
+          cc -std=c11 -O2 -Wall -Wextra -Werror -ffunction-sections -fdata-sections -pthread -I. tests/test_runtime_services.c src/runtime.c src/runtime_services.c src/runtime_ss.c src/runtime_content.c src/runtime_rtc.c src/runtime_file.c src/runtime_cpu.c src/runtime_low_memory.c -Wl,--gc-sections -o /tmp/test-runtime-services
+          /tmp/test-runtime-services
+          cc -std=c11 -O2 -Wall -Wextra -Werror -ffunction-sections -fdata-sections -pthread -I. tests/test_runtime_usbd.c src/runtime.c src/runtime_usbd.c src/runtime_low_memory.c -Wl,--gc-sections -o /tmp/test-runtime-usbd
+          /tmp/test-runtime-usbd
+          cc -std=c11 -D_GNU_SOURCE -O2 -Wall -Wextra -ffunction-sections -fdata-sections -I. tests/test_runtime_capture.c src/runtime_capture.c src/runtime.c -Wl,--gc-sections -pthread -o /tmp/test-runtime-capture
+          /tmp/test-runtime-capture
+      - name: Test guest context restoration and verify generated instructions
+        run: |
+          python3 tools/generate-setcontext.py --check
+          python3 tools/generate-setcontext.py --fixture --check
+          cc -std=c11 -O2 -Wall -Wextra -I. -Isrc tests/test_guest_setcontext.c src/runtime_cpu.c src/runtime_low_memory.c -pthread -o /tmp/test-guest-setcontext
+          /tmp/test-guest-setcontext
+      - name: Test thread cleanup and linked module lifecycle
+        run: |
+          cc -std=c11 -O2 -Wall -Wextra -ffunction-sections -fdata-sections -I. -Isrc tests/test_runtime_thread_contracts.c src/runtime_cpu.c src/runtime_low_memory.c -Wl,--gc-sections -Wl,--wrap=nanosleep -pthread -o /tmp/test-runtime-threads
+          /tmp/test-runtime-threads
+          cc -std=c11 -O2 -Wall -Wextra -ffunction-sections -fdata-sections -I. -Isrc tests/test_runtime_modules.c -Wl,--gc-sections -pthread -lm -o /tmp/test-runtime-modules
+          /tmp/test-runtime-modules
+      - name: Test import auditing with synthetic metadata and public providers
+        run: |
+          python3 tests/test_import_audit.py
+      - name: Test control and shutdown hooks with a synthetic x86 image
+        run: |
+          mkdir -p out/exit-regression
+          for source in src/runtime_exit.c src/runtime_cpu.c src/runtime_low_memory.c src/runtime_memory.c; do
+            cc -std=c11 -O2 -Wall -Wextra -ffunction-sections -fdata-sections -I. -c "$source" -o "out/exit-regression/$(basename "${source%.c}").o"
+          done
+          c++ -std=c++20 -O2 -ffunction-sections -fdata-sections -DDRIVECLUB_NATIVE_EXIT_TEST=1 tests/test_android_fex.cpp out/exit-regression/*.o -Wl,--gc-sections -Wl,--wrap=mmap -Wl,--wrap=guest_cpu_call -pthread -o out/exit-regression/test-exit
+          out/exit-regression/test-exit
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -85,6 +131,10 @@ jobs:
           fi
       - name: Test selected Vulkan dispatch and driver switching
         run: bash android/tools/test-vulkan-dispatch.sh
+      - name: Test physical mappings and sparse PRT coverage
+        run: |
+          c++ -std=c++20 -O2 -Wall -Wextra -Iout/android-gpu/prefix/include tests/test_gpu_mapped_ranges.cpp -o out/test-gpu-mapped-ranges
+          out/test-gpu-mapped-ranges
       - run: ./gradlew assembleDebug
         working-directory: android
       - name: Verify packaged Bionic runtime and dependency closure
@@ -97,9 +147,11 @@ jobs:
       - name: Extract the packaged FEX backend for the ARM64 execution test
         run: |
           mkdir -p out/fex-test
-          unzip -j android/build/outputs/apk/debug/*.apk 'lib/arm64-v8a/libbbcpu.so' 'lib/arm64-v8a/libc++_shared.so' -d out/fex-test
+          unzip -j android/build/outputs/apk/debug/*.apk 'lib/arm64-v8a/libbbcpu.so' 'lib/arm64-v8a/libc++_shared.so' 'lib/arm64-v8a/libdriveclub_game.so' 'lib/arm64-v8a/libdriveclub_vulkan.so' -d out/fex-test
           runtime_archive="$(python3 -c 'from pathlib import Path; archives=list(Path("android/.cxx").glob("**/arm64-v8a/libdriveclub_runtime.a")); assert len(archives) == 1, archives; print(archives[0])')"
-          "$ANDROID_HOME/ndk/29.0.14206865/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android30-clang++" tests/test_android_fex.cpp "$runtime_archive" -Wl,--gc-sections -Wl,--wrap=mmap -Lout/fex-test -lbbcpu -o out/fex-test/test-fex
+          "$ANDROID_HOME/ndk/29.0.14206865/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android30-clang++" tests/test_android_fex.cpp "$runtime_archive" -Wl,--gc-sections -Wl,--wrap=mmap -Wl,--wrap=guest_cpu_call -Lout/fex-test -lbbcpu -o out/fex-test/test-fex
+          "$ANDROID_HOME/ndk/29.0.14206865/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android30-clang++" -std=c++20 tests/test_android_imports.cpp -ldl -o out/fex-test/test-imports
+          "$ANDROID_HOME/ndk/29.0.14206865/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android30-clang++" -std=c++20 -O2 -Wall -Wextra -Igpu/shadps4 -Iout/android-gpu/prefix/include tests/test_image_codecs.cpp gpu/bbnet/jpeg_dec.cpp gpu/bbnet/png_enc.cpp out/android-gpu/prefix/lib/libpng16.a -lz -o out/fex-test/test-image-codecs
       - uses: actions/upload-artifact@v4
         with:
           name: bionic-fex-test
@@ -159,7 +211,7 @@ jobs:
   fex:
     needs: apk
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 12
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -170,14 +222,27 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y e2fsprogs
-          python3 android/tools/fetch-bionic-runtime.py --output out/android-bionic
+          python3 android/tools/fetch-bionic-runtime.py --output out/android-bionic --platform-libraries
       - name: Execute x86-64 instructions with the packaged ARM64 Bionic backend
         run: |
           set -o pipefail
           chmod +x fex-test/test-fex
           python3 android/tools/run-bionic-test.py --runtime out/android-bionic fex-test/test-fex | tee fex-test/validation.txt
+      - name: Check declared public providers against the linked APK library
+        run: |
+          set -o pipefail
+          chmod +x fex-test/test-imports
+          python3 android/tools/run-bionic-test.py --runtime out/android-bionic fex-test/test-imports | tee fex-test/import-validation.txt
+      - name: Execute JPEG and PNG codec contracts on Bionic ARM64
+        run: |
+          set -o pipefail
+          chmod +x fex-test/test-image-codecs
+          python3 android/tools/run-bionic-test.py --runtime out/android-bionic fex-test/test-image-codecs | tee fex-test/codec-validation.txt
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: bionic-fex-validation
-          path: fex-test/validation.txt
+          path: |
+            fex-test/validation.txt
+            fex-test/import-validation.txt
+            fex-test/codec-validation.txt

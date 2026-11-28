@@ -215,7 +215,7 @@ To record a new profile after the code has changed a lot: build with `BB_PGO=gen
 
 ## Android ARM64 (Bionic and FEX)
 
-The Android 0.6 target integrates the local preparer, Driveclub loader/HLE, FEXCore,
+The Android 0.7 target integrates the local preparer, Driveclub loader/HLE, FEXCore,
 the existing shadPS4-based renderer, local FPKG installation, a bundled Turnip
 selector and analogue touch controls. It targets `arm64-v8a`, Android 11/API 30
 or later, using Bionic throughout. The 0.6 APK audit, seven host PKG tests,
@@ -228,9 +228,10 @@ Android device run with the user's game files and its startup log.
 The supplied 0.5 device log confirms local preparation of update 1.28, loading
 Turnip Gen8 V39-patched on Adreno 840, creation of the native Vulkan swapchain,
 initialization of all seven boot modules and entry into the original game code.
-It then records failed mappings for FlexHeap and MagicMemory, followed by a native
-fault when the game calls `memmove` into the unmapped FlexHeap. That run does not
-establish menu or gameplay rendering.
+The subsequent 0.6 device log confirms that both displaced heaps now map and
+the game continues through resource, physics, audio and UI initialization and
+archive reads. It stops at the unresolved `sceKernelSetPrtAperture` import.
+Neither device run establishes menu or gameplay rendering.
 
 ### Build
 
@@ -408,6 +409,53 @@ Vulkan probe alone does not prove that those renderer requirements are satisfied
 
 ### Verification
 
+#### Android 0.7 startup and runtime contracts
+
+The 0.7 changes implement sparse PRT aperture state separately from physical
+backing. The renderer tracks aperture coverage without claiming that CPU holes
+have backing; it enables supported sparse aliasing and required queue features.
+Tests preserve physical aliases when an aperture changes and check that failed
+checked releases leave memory intact.
+
+The regional button predicate, stream destructor and offline retry hooks call
+guest code through the CPU bridge. Synthetic tests exercise the actual hooks,
+warm and invalidate translations, check the low-byte boolean ABI, and run again
+with the FEX library extracted from the APK. `__Ux86_64_setcontext` is a guest
+x86 restore path matching the context producer in the supplied `libc.prx`,
+including x87/SSE state; it does not pass guest contexts to Bionic `setcontext`.
+
+Thread tests cover detach/join races, low-address TLS, key reuse and destructor
+ordering. Module initialization has stable handles, serialized transitions and
+cached failures. Pinned modules report `EBUSY` on unload: real `DT_FINI` unloading
+is not implemented. Separate guest stacks and TLS are freed; custom host thread
+stacks remain retained until a safe reclamation mechanism is added.
+
+Additional behavior tests cover offline dialog state/results, Voice argument
+order and result sizes, AppContent filesystem operations, RTC parsing and empty
+raw-USB discovery with real event waits. Android touch/gamepad input remains the
+controller path. JPEG decoding and PNG encoding have pixel-level tests on host
+and a separate ARM64/Bionic test target. See
+[service contracts](tools/README-service-contracts.md) for the remaining UI,
+voice and online limitations.
+
+The loader enumerates unresolved imports before allocating the image or starting
+the renderer. `--check-imports` exits after validating the image metadata and
+payload extent without executing game code. The local source audit can read the
+user's original SELF files; the live loader also checks modules only present on
+the device. Game-derived inventories stay outside the repository and CI. The
+Android resolver test opens the actual APK library and checks provider cases
+generated from the port's public source declarations. See
+[import audit](tools/README-import-audit.md). Neither registration nor an import
+count certifies gameplay.
+
+The CI gates include the existing six launcher/PKG/touch integration tests and
+three tests for applying screenshot policy on the UI thread and handling timeout,
+the new host contract tests, the packaged FEX regression, the actual linked
+resolver and JPEG/PNG execution on Bionic ARM64. The linked test extracts real
+system-library dependencies from the pinned official Android image using
+`fetch-bionic-runtime.py --platform-libraries`; those test libraries are never
+packaged in the app. Results for the 0.7 build are recorded after CI completes.
+
 #### Android 0.6 memory regression
 
 All three jobs passed in the
@@ -420,8 +468,8 @@ The delivered 0.6 APK is 17,209,904 bytes, SHA-256
 `15e49e45b1eacbf92f722d8c2331790cfec503e605f8639a042cc2f211e117de`.
 Its signature matches the delivered 0.5 certificate, the package ID is unchanged,
 and versionCode increases from 5 to 6. All 28 non-signature ZIP entries match the
-CI APK, and the audit passed again after private signing. A subsequent device
-run is still needed to observe the original game's progress beyond this crash.
+CI APK, and the audit passed again after private signing. The subsequent device
+log confirms successful fallback mappings and progress to PRT initialization.
 
 The failing device run mapped MainHeap at `0x2000000000` (530 MiB) and
 VideoPrivate at `0x5000000000` (3674 MiB), but failed to map FlexHeap at
@@ -530,7 +578,7 @@ Build the FEX ABI test against the backend extracted from the APK:
       'lib/arm64-v8a/libbbcpu.so' 'lib/arm64-v8a/libc++_shared.so' -d out/fex-test
     "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android30-clang++" \
       -std=c++20 tests/test_android_fex.cpp out/android-runtime/libdriveclub-runtime.a \
-      -Wl,--gc-sections -Wl,--wrap=mmap -Wl,-z,max-page-size=16384 -Lout/fex-test -lbbcpu -o out/fex-test/test-fex
+      -Wl,--gc-sections -Wl,--wrap=mmap -Wl,--wrap=guest_cpu_call -Wl,-z,max-page-size=16384 -Lout/fex-test -lbbcpu -o out/fex-test/test-fex
 
 For a host-side run, obtain the pinned official Android API 30 ARM64 Bionic runtime
 with `fetch-bionic-runtime.py`. Extraction needs `debugfs` from `e2fsprogs` and about

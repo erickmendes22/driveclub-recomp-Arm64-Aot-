@@ -5,10 +5,12 @@
  * honest one for that situation: no entitlements, no dialogs open, nothing left to install. Each
  * such answer is logged once, so it shows in the log instead of looking like a real feature. */
 #include "runtime.h"
+#include "runtime_dialogs.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <pthread.h>
 
 #ifdef _WIN32
 #define gmtime_r(time, out) (gmtime_s((out), (time)) ? NULL : (out))
@@ -27,13 +29,6 @@ static void log_once(volatile int *flag, const char *what) {
 /* Base PS4 mode. The Pro-mode checkerboard path is a separate piece of work. */
 static ABI int32_t kernel_is_neo(void) { return 0; }
 static ABI int32_t kernel_mlock(const void *addr, uint64_t length) { (void)addr; (void)length; return 0; }
-/* sceKernelGetPrtAperture: no PRT aperture has been configured, so report an empty one. */
-static ABI int32_t kernel_prt_aperture(int32_t id, uint64_t *address, uint64_t *size) {
-    if (id < 0 || id >= 3) return SCE_ERR(E_INVAL);
-    if (address) *address = 0;
-    if (size) *size = 0;
-    return 0;
-}
 /* The unwinder asks which module owns an address; the linked image is one flat module, so the
    honest answer is "not found" and the caller falls back to its own tables. */
 static ABI int32_t module_info_not_found(uint64_t addr, int32_t flags, void *info) {
@@ -140,18 +135,62 @@ static ABI int32_t safe_area_info(SafeAreaInfo *info) {
     return 0;
 }
 static ABI int32_t pad_set_light_bar(int32_t handle, const void *param) { (void)handle; (void)param; return 0; }
-/* Error dialog: the port has no UI for it. Initialize/Open succeed and the dialog reports
-   FINISHED at once, so a game that waits for the player to dismiss it does not block. */
-static ABI int32_t common_ok(void) { return 0; }
-static ABI int32_t error_dialog_open(const void *param) { (void)param; ONCE("sceErrorDialog: shown as already finished"); return 0; }
-static ABI int32_t error_dialog_status(void) { return 3; /* FINISHED */ }
-/* The save-data dialog is never opened by this port, so there is never a result to fetch. */
-static ABI int32_t savedata_dialog_result(void *result) { (void)result; return (int32_t)0x80B8000B; /* NOT_RUNNING */ }
-/* No add-on content is installed. */
-static ABI int32_t appcontent_addcont_info(uint32_t label, const void *entitlement, void *info) {
-    (void)label;
-    if (!entitlement || !info) return (int32_t)0x80D90002; /* APP_CONTENT_ERROR_PARAMETER */
-    return (int32_t)0x80D90007; /* APP_CONTENT_ERROR_DRM_NO_ENTITLEMENT */
+/* ErrorDialog has its own lifecycle/error family; it is not a CommonDialog
+ * owner. The error is surfaced in the persistent diagnostic log, then dismissed
+ * on UpdateStatus. It has no result/affirmative selection to fabricate. */
+#define ERROR_DIALOG_NOT_INITIALIZED ((int32_t)0x80ED0001)
+#define ERROR_DIALOG_ALREADY_INITIALIZED ((int32_t)0x80ED0002)
+#define ERROR_DIALOG_PARAM_INVALID ((int32_t)0x80ED0003)
+#define ERROR_DIALOG_INVALID_STATE ((int32_t)0x80ED0005)
+static pthread_mutex_t error_dialog_lock=PTHREAD_MUTEX_INITIALIZER;
+static int error_dialog_state;
+_Static_assert(sizeof(ErrorDialogParam)==16,"error dialog ABI");
+static ABI int32_t error_dialog_init(void) {
+    pthread_mutex_lock(&error_dialog_lock);
+    int32_t result=error_dialog_state!=DIALOG_NONE ? ERROR_DIALOG_ALREADY_INITIALIZED : 0;
+    if (!result) error_dialog_state=DIALOG_INITIALIZED;
+    pthread_mutex_unlock(&error_dialog_lock);
+    return result;
+}
+static ABI int32_t error_dialog_open(const ErrorDialogParam *param) {
+    pthread_mutex_lock(&error_dialog_lock);
+    int32_t result=error_dialog_state!=DIALOG_INITIALIZED && error_dialog_state!=DIALOG_FINISHED ?
+        ERROR_DIALOG_INVALID_STATE : !param || param->size!=(int32_t)sizeof(*param) ?
+        ERROR_DIALOG_PARAM_INVALID : 0;
+    if (!result) {
+        printf("Runtime: ErrorDialog error=0x%08x user=%d; logged, no platform dialog UI\n",
+               (unsigned)param->error_code,param->user_id);
+        error_dialog_state=DIALOG_RUNNING;
+    }
+    pthread_mutex_unlock(&error_dialog_lock);
+    return result;
+}
+static ABI int32_t error_dialog_status(void) {
+    pthread_mutex_lock(&error_dialog_lock);
+    if (error_dialog_state==DIALOG_RUNNING) error_dialog_state=DIALOG_FINISHED;
+    int status=error_dialog_state;
+    pthread_mutex_unlock(&error_dialog_lock);
+    return status;
+}
+static ABI int32_t error_dialog_get_status(void) {
+    pthread_mutex_lock(&error_dialog_lock);
+    int status=error_dialog_state;
+    pthread_mutex_unlock(&error_dialog_lock);
+    return status;
+}
+static ABI int32_t error_dialog_close(void) {
+    pthread_mutex_lock(&error_dialog_lock);
+    int32_t result=error_dialog_state!=DIALOG_RUNNING ? ERROR_DIALOG_INVALID_STATE : 0;
+    if (!result) error_dialog_state=DIALOG_FINISHED;
+    pthread_mutex_unlock(&error_dialog_lock);
+    return result;
+}
+static ABI int32_t error_dialog_term(void) {
+    pthread_mutex_lock(&error_dialog_lock);
+    int32_t result=error_dialog_state==DIALOG_NONE ? ERROR_DIALOG_NOT_INITIALIZED : 0;
+    if (!result) error_dialog_state=DIALOG_NONE;
+    pthread_mutex_unlock(&error_dialog_lock);
+    return result;
 }
 
 uintptr_t runtime_ss_resolve(const char *name) {
@@ -159,7 +198,6 @@ uintptr_t runtime_ss_resolve(const char *name) {
     if (evf) return evf;
     static const RuntimeExport table[] = {
         {"sceKernelIsNeoMode", kernel_is_neo}, {"sceKernelMlock", kernel_mlock},
-        {"sceKernelGetPrtAperture", kernel_prt_aperture},
         {"sceKernelGetModuleInfoFromAddr", module_info_not_found},
         {"sceKernelGetModuleInfoForUnwind", module_info_not_found},
         {"sceKernelInternalMemoryGetModuleSegmentInfo", module_segment_info},
@@ -172,10 +210,9 @@ uintptr_t runtime_ss_resolve(const char *name) {
         {"sceSystemServiceParamGetString", system_param_string},
         {"sceSystemServiceGetDisplaySafeAreaInfo", safe_area_info},
         {"scePadSetLightBar", pad_set_light_bar},
-        {"sceErrorDialogInitialize", common_ok}, {"sceErrorDialogTerminate", common_ok},
+        {"sceErrorDialogInitialize", error_dialog_init}, {"sceErrorDialogTerminate", error_dialog_term},
         {"sceErrorDialogOpen", error_dialog_open}, {"sceErrorDialogUpdateStatus", error_dialog_status},
-        {"sceSaveDataDialogGetResult", savedata_dialog_result},
-        {"sceAppContentGetAddcontInfo", appcontent_addcont_info},
+        {"sceErrorDialogGetStatus", error_dialog_get_status}, {"sceErrorDialogClose", error_dialog_close},
     };
     return RUNTIME_LOOKUP(table, name);
 }

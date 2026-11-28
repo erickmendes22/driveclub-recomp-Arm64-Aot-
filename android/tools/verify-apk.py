@@ -51,6 +51,7 @@ REQUIRED_EXPORTS = {
         "guest_cpu_thread_end", "guest_cpu_return_address", "guest_cpu_stack_pointer",
         "guest_cpu_signal_regs", "guest_cpu_host_pc", "guest_cpu_handle_fault",
         "guest_cpu_hook", "guest_cpu_tsc", "guest_cpu_tsc_frequency",
+        "guest_cpu_libunwind_setcontext",
     },
     "libc++_shared.so": set(),
 }

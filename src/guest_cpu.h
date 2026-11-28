@@ -40,6 +40,11 @@ void guest_cpu_code_changed(uintptr_t address, size_t size);
 /* The guest-callable address of host function `fn` (SysV ABI on the guest side, at most 14
  * integer arguments and 8 vector arguments; no structures by value, no va_list). */
 uintptr_t guest_cpu_host_function(void *fn);
+/* Import marker for Orbis HP-libunwind's __Ux86_64_setcontext. Pass its address
+ * to guest_cpu_host_function, which supplies an x86-64 restore entry (native or
+ * translated by FEX). Calling this marker directly is an integration error.
+ * The entry restores the supplied libc.prx context, never a host ucontext_t. */
+int guest_cpu_libunwind_setcontext(const void *context);
 /* Calls guest function `fn` with `count` integer arguments; returns RAX. On this thread's current
  * guest stack when the host was called by guest code, else on the stack set by
  * guest_cpu_thread_stack (or one allocated for the thread). */

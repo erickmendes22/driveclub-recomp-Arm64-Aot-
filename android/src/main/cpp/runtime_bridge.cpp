@@ -10,11 +10,13 @@
 #include <cstring>
 #include <fcntl.h>
 #include <filesystem>
+#include <mutex>
 #include <string>
 #include <unistd.h>
 #include <vector>
 
 extern "C" int driveclub_runtime_main(int argc, char **argv);
+extern "C" void runtime_capture_set_screenshot_hook(int (*hook)(int enabled));
 
 namespace {
 JavaVM *vm;
@@ -23,6 +25,9 @@ jmethodID open_file, stat_file, list_files, resolve_file;
 jclass missing_file, denied_file;
 std::atomic<bool> started{false};
 thread_local unsigned java_callback_depth;
+std::mutex screenshot_mutex;
+jobject screenshot_activity;
+jmethodID apply_screenshot_policy;
 
 class Env {
     JNIEnv *env_ = nullptr;
@@ -38,6 +43,85 @@ public:
     }
     ~Env() { if (attached_) vm->DetachCurrentThread(); --java_callback_depth; }
     JNIEnv *get() const { return env_; }
+};
+
+int screenshot_policy(int enabled) {
+    Env attached;
+    JNIEnv *env = attached.get();
+    if (!env) return -1;
+    jobject activity = nullptr;
+    jmethodID apply = nullptr;
+    {
+        std::lock_guard lock(screenshot_mutex);
+        if (screenshot_activity) {
+            activity = env->NewLocalRef(screenshot_activity);
+            apply = apply_screenshot_policy;
+        }
+    }
+    if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+        if (activity) env->DeleteLocalRef(activity);
+        return -1;
+    }
+    if (!activity || !apply) {
+        if (activity) env->DeleteLocalRef(activity);
+        return -1;
+    }
+    // No native mutex crosses the call: Java waits for the UI to acknowledge the
+    // window policy. The local reference survives concurrent hook retirement.
+    const jboolean applied = env->CallBooleanMethod(activity, apply, enabled ? JNI_TRUE : JNI_FALSE);
+    const bool failed = env->ExceptionCheck();
+    if (failed) env->ExceptionClear();
+    env->DeleteLocalRef(activity);
+    if (failed || applied != JNI_TRUE) {
+        std::fprintf(stderr, "Android: screenshot window policy was not applied (%s)\n",
+                     enabled ? "enable" : "disable");
+        return -1;
+    }
+    return 0;
+}
+
+class ScreenshotBinding {
+    JNIEnv *env_;
+    bool installed_ = false;
+public:
+    explicit ScreenshotBinding(JNIEnv *env) : env_(env) {}
+    int initialize(jobject activity) {
+        if (!activity) return EINVAL;
+        jclass cls = env_->GetObjectClass(activity);
+        jmethodID apply = cls ? env_->GetMethodID(cls, "applyScreenshotPolicy", "(Z)Z") : nullptr;
+        if (cls) env_->DeleteLocalRef(cls);
+        if (env_->ExceptionCheck() || !apply) {
+            env_->ExceptionClear();
+            return EINVAL;
+        }
+        jobject reference = env_->NewGlobalRef(activity);
+        if (env_->ExceptionCheck() || !reference) {
+            env_->ExceptionClear();
+            if (reference) env_->DeleteGlobalRef(reference);
+            return ENOMEM;
+        }
+        {
+            std::lock_guard lock(screenshot_mutex);
+            screenshot_activity = reference;
+            apply_screenshot_policy = apply;
+        }
+        runtime_capture_set_screenshot_hook(screenshot_policy);
+        installed_ = true;
+        return 0;
+    }
+    ~ScreenshotBinding() {
+        if (!installed_) return;
+        runtime_capture_set_screenshot_hook(nullptr);
+        jobject reference;
+        {
+            std::lock_guard lock(screenshot_mutex);
+            reference = screenshot_activity;
+            screenshot_activity = nullptr;
+            apply_screenshot_policy = nullptr;
+        }
+        if (reference) env_->DeleteGlobalRef(reference);
+    }
 };
 
 int exception_errno(JNIEnv *env) {
@@ -234,7 +318,7 @@ extern "C" int driveclub_android_resolve(const char *path, char *out, size_t siz
 }
 
 extern "C" JNIEXPORT jint JNICALL Java_org_driveclub_port_GameActivity_runNative(
-        JNIEnv *env, jclass, jstring prepared_dir, jstring user_dir, jstring log_path,
+        JNIEnv *env, jobject activity, jstring prepared_dir, jstring user_dir, jstring log_path,
         jobject provider, jobject surface) {
     if (started.exchange(true)) return EALREADY;
     const std::string prepared = utf(env, prepared_dir), user = utf(env, user_dir), log = utf(env, log_path);
@@ -285,6 +369,11 @@ extern "C" JNIEXPORT jint JNICALL Java_org_driveclub_port_GameActivity_runNative
     for (auto &arg : args) argv.push_back(arg.data());
     argv.push_back(nullptr);
     std::puts("Android: document trees mounted read-only; archive reads stay on the selected device storage.");
+    ScreenshotBinding screenshot_binding(env);
+    if (int error = screenshot_binding.initialize(activity)) {
+        std::fprintf(stderr, "Android: screenshot policy bridge initialization failed (%d)\n", error);
+        return error;
+    }
     const int result = driveclub_runtime_main(static_cast<int>(args.size()), argv.data());
     std::fprintf(stderr, "Android: runtime returned %d\n", result);
     return result;

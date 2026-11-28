@@ -65,6 +65,13 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym);
 namespace Libraries::PngDec {
 void RegisterLib(Core::Loader::SymbolsResolver* sym);
 }
+namespace Libraries::JpegDec { void RegisterLib(Core::Loader::SymbolsResolver* sym); }
+namespace Libraries::PngEnc { void RegisterLib(Core::Loader::SymbolsResolver* sym); }
+namespace Libraries::Np::NpAuth { void Initialize(); }
+namespace Libraries::Np::NpManager { void Initialize(); }
+namespace Libraries::Np::NpScore { void Initialize(); }
+namespace Libraries::Np::NpWebApi { void Initialize(); }
+namespace Libraries::Np::NpWebApi2 { void Initialize(); }
 
 extern "C" {
 int32_t runtime_thread_spawn(void** out, void* PS4_SYSV_ABI (*entry)(void*), void* argument,
@@ -460,7 +467,7 @@ extern "C" void bbnet_configure(const char* app0, const char* serial, const char
 
 // ---- Registration ------------------------------------------------------------------------------
 
-extern "C" void bbnet_register(void) {
+static void RegisterNetworkSymbols() {
     Core::Loader::SymbolsResolver resolver;
     Core::Loader::SymbolsResolver* sym = &resolver;
     Libraries::Net::RegisterLib(sym);
@@ -482,4 +489,23 @@ extern "C" void bbnet_register(void) {
     Libraries::Np::NpWebApi2::RegisterLib(sym);
     Libraries::Rudp::RegisterLib(sym);
     Libraries::PngDec::RegisterLib(sym);
+    Libraries::JpegDec::RegisterLib(sym);
+    Libraries::PngEnc::RegisterLib(sym);
+}
+
+extern "C" void bbnet_register_symbols(void) {
+    static std::once_flag registered;
+    std::call_once(registered, RegisterNetworkSymbols);
+}
+
+extern "C" void bbnet_register(void) {
+    bbnet_register_symbols();
+    static std::once_flag initialized;
+    std::call_once(initialized, [] {
+        Libraries::Np::NpAuth::Initialize();
+        Libraries::Np::NpManager::Initialize();
+        Libraries::Np::NpScore::Initialize();
+        Libraries::Np::NpWebApi::Initialize();
+        Libraries::Np::NpWebApi2::Initialize();
+    });
 }

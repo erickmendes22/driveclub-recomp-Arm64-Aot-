@@ -960,6 +960,13 @@ struct PageManager::Impl {
 
     static bool GuestFaultSignalHandler(void* context, void* fault_address) {
         const auto addr = reinterpret_cast<VAddr>(fault_address);
+        // An aperture is GPU address coverage, not a host mapping. A CPU access
+        // to one of its holes cannot be repaired by GPU readback or mprotect.
+        // Let the runtime diagnose that fault instead of retrying it forever.
+        // Use the existing renderer snapshot, without taking a second VMA lock.
+        if (!rasterizer->IsPhysicallyMapped(addr, 1)) {
+            return false;
+        }
         // bbport: the draw recording thread handles its faults inline too (vk_draw_pipe.h).
         const auto is_gpu_thread = rasterizer->IsGpuSideThread();
         if (is_gpu_thread) {

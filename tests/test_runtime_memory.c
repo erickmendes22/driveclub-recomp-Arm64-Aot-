@@ -253,6 +253,167 @@ static void test_reservations_and_metadata_failure(void) {
     puts("PASS: guest reservation replacement and metadata failure without a leaked host mapping");
 }
 
+static PrtAperture observed_prt[PRT_APERTURES];
+static unsigned prt_callbacks;
+static void prt_hook(unsigned id, uintptr_t address, uint64_t size) {
+    assert(id<PRT_APERTURES);
+    observed_prt[id]=(PrtAperture){address,size};
+    ++prt_callbacks;
+    /* GPU callbacks may query the runtime: they must run outside its writer lock. */
+    void *current=NULL; uint64_t current_size=UINT64_MAX;
+    assert(!get_prt_aperture((int32_t)id,&current,&current_size));
+    assert((uintptr_t)current==address && current_size==size);
+}
+
+static void test_prt_contract_and_driveclub_aliases(void) {
+    typedef int32_t (ABI *SetPrt)(int32_t,void *,uint64_t);
+    typedef int32_t (ABI *GetPrt)(int32_t,void **,uint64_t *);
+    typedef int32_t (ABI *CheckedRelease)(uint64_t,uint64_t);
+    SetPrt set_prt=(SetPrt)runtime_memory_resolve("BohYr-F7-is#BD#E");
+    GetPrt get_prt=(GetPrt)runtime_memory_resolve("L0v2Go5jOuM#BD#E");
+    CheckedRelease checked_release=(CheckedRelease)runtime_memory_resolve("hwVSPCmp5tM#BD#E");
+    assert(set_prt && get_prt && checked_release);
+    const uintptr_t aperture=UINT64_C(0x1000000000);
+    const uint64_t tile_bytes=6*PAGE, tail_offset=2*1024*1024, tail_bytes=2*PAGE;
+    const uint64_t aperture_size=tail_offset+tail_bytes, physical_size=tile_bytes+tail_bytes;
+    void *query_base=(void *)UINTPTR_MAX;
+    uint64_t query_size=UINT64_MAX;
+    for (int id=0;id<PRT_APERTURES;++id) {
+        assert(!get_prt(id,&query_base,&query_size) && !query_base && !query_size);
+    }
+    assert(get_prt(-1,&query_base,&query_size)==INVALID);
+    assert(get_prt(PRT_APERTURES,&query_base,&query_size)==INVALID);
+    assert(get_prt(0,NULL,&query_size)==INVALID && get_prt(0,&query_base,NULL)==INVALID);
+    runtime_memory_set_prt_hook(prt_hook);
+    assert(prt_callbacks==PRT_APERTURES);
+
+    unsigned before_calls=explicit_mmap_calls, before_callbacks=prt_callbacks, before_maps=mapped_hooks;
+    size_t before_vmas=vma_count;
+    uint64_t before_live=live_bytes;
+    assert(!set_prt(0,(void *)aperture,aperture_size));
+    assert(!get_prt(0,&query_base,&query_size) && query_base==(void *)aperture && query_size==aperture_size);
+    assert(observed_prt[0].address==aperture && observed_prt[0].size==aperture_size);
+    assert(prt_callbacks==before_callbacks+1 && explicit_mmap_calls==before_calls && mapped_hooks==before_maps);
+    assert(vma_count==before_vmas && live_bytes==before_live && !flexible_bytes);
+    assert(!runtime_memory_is_mapped(aperture,aperture_size));
+    assert_free(aperture,aperture_size); /* Configuring PRT did not allocate host pages. */
+    assert(!set_prt(0,(void *)aperture,aperture_size) && prt_callbacks==before_callbacks+1);
+    assert(set_prt(-1,(void *)aperture,aperture_size)==INVALID);
+    assert(set_prt(PRT_APERTURES,(void *)aperture,aperture_size)==INVALID);
+    assert(set_prt(0,(void *)(aperture+1),aperture_size)==INVALID);
+    assert(set_prt(0,(void *)(USER_MIN-4096),aperture_size)==INVALID);
+    assert(set_prt(0,(void *)USER_MAX,1)==INVALID);
+    assert(set_prt(0,(void *)aperture,UINT64_MAX)==INVALID);
+    assert(!get_prt(0,&query_base,&query_size) && query_base==(void *)aperture && query_size==aperture_size);
+    assert(prt_callbacks==before_callbacks+1);
+    /* The aperture API uses 4 KiB base alignment, independently of 16 KiB
+     * physical pages; it does not round or invent a size alignment. */
+    assert(!set_prt(1,(void *)(aperture+4096),17));
+    assert(!get_prt(1,&query_base,&query_size) && query_base==(void *)(aperture+4096) && query_size==17);
+    assert(!set_prt(2,(void *)USER_MAX,0));
+
+    int64_t physical=-1;
+    assert(!direct_allocate(0,POOL_SIZE,physical_size,65536,3,&physical));
+    void *master=(void *)UINT64_C(0x7f0000000);
+    assert(!direct_map(&master,physical_size,0x33,0,physical,65536));
+    memset(master,0x36,tile_bytes);
+    memset((unsigned char *)master+tile_bytes,0xa5,tail_bytes);
+    /* The original caller at guest0x749267 configures PRT, then maps six
+     * tiles and a separate mip tail as physical aliases at guest0x74929c/301. */
+    void *tiles=(void *)aperture, *tail=(void *)(aperture+tail_offset);
+    assert(!direct_map(&tiles,tile_bytes,0x33,MAP_FIXED_FLAG,physical,2*1024*1024));
+    assert(!direct_map(&tail,tail_bytes,0x33,MAP_FIXED_FLAG,physical+tile_bytes,2*1024*1024));
+    assert(!set_virtual_range_name(tiles,tile_bytes,"PRT tiles"));
+    assert(!set_virtual_range_name(tail,tail_bytes,"PRT mip tail"));
+    assert(((unsigned char *)tiles)[0]==0x36 && ((unsigned char *)tail)[0]==0xa5);
+    VirtualQueryInfo query;
+    assert(!virtual_query(tail,0,&query,sizeof(query)) && query.offset==(uint64_t)physical+tile_bytes);
+    assert(!strcmp(query.name,"PRT mip tail") && query.protection==0x33);
+    assert(virtual_query((void *)(aperture+tile_bytes),0,&query,sizeof(query))==ACCESS);
+    unsigned char sparse[3*PAGE];
+    memset(sparse,0xcc,sizeof(sparse));
+    runtime_memory_read_sparse(aperture+tail_offset-PAGE,sparse,sizeof(sparse));
+    for (size_t i=0;i<PAGE;++i) assert(sparse[i]==0);
+    for (size_t i=PAGE;i<sizeof(sparse);++i) assert(sparse[i]==0xa5);
+    assert(!runtime_memory_read_backing(aperture+tile_bytes,sparse,PAGE));
+
+    assert(!checked_release(physical+PAGE,2*PAGE));
+    assert(!runtime_memory_is_mapped(aperture+PAGE,2*PAGE));
+    assert(!runtime_memory_is_mapped((uintptr_t)master+PAGE,2*PAGE));
+    assert(!get_prt(0,&query_base,&query_size) && query_base==(void *)aperture && query_size==aperture_size);
+    runtime_memory_read_sparse(aperture,sparse,sizeof(sparse));
+    for (size_t i=0;i<PAGE;++i) assert(sparse[i]==0x36);
+    for (size_t i=PAGE;i<sizeof(sparse);++i) assert(sparse[i]==0);
+    size_t retained_vmas=vma_count;
+    uint64_t retained_bytes=live_bytes;
+    assert(checked_release(physical,physical_size)==NOT_FOUND);
+    assert(vma_count==retained_vmas && live_bytes==retained_bytes);
+    assert(((unsigned char *)tiles)[0]==0x36 && ((unsigned char *)tail)[0]==0xa5);
+    assert(checked_release(POOL_SIZE,PAGE)==NOT_FOUND);
+    assert(checked_release(UINT64_MAX-PAGE+1,PAGE)==NOT_FOUND);
+    assert(checked_release(physical,UINT64_MAX-PAGE+1)==NOT_FOUND);
+    assert(checked_release(physical+1,PAGE)==INVALID);
+    assert(checked_release(physical,PAGE+1)==INVALID);
+    assert(!checked_release(POOL_SIZE,0));
+    /* Refill the released hole as a new allocation. Checked release then
+     * covers three adjacent physical blocks and removes every alias. */
+    int64_t refill=-1;
+    assert(!direct_allocate(physical+PAGE,physical+3*PAGE,2*PAGE,PAGE,3,&refill));
+    assert(refill==physical+(int64_t)PAGE);
+    void *restored=(void *)(aperture+PAGE);
+    assert(!direct_map(&restored,2*PAGE,0x33,MAP_FIXED_FLAG,refill,PAGE));
+    for (size_t i=0;i<2*PAGE;++i) assert(((unsigned char *)restored)[i]==0);
+    assert(!checked_release(physical,physical_size));
+    assert(!vma_count && !live_bytes);
+    assert_free(aperture,aperture_size);
+
+    /* Disable/reconfigure and install a fresh GPU hook: the complete state is
+     * replayed, including zero-size slots, without changing CPU VMAs. */
+    runtime_memory_set_prt_hook(NULL);
+    before_callbacks=prt_callbacks;
+    assert(!set_prt(0,(void *)aperture,0));
+    assert(!set_prt(1,(void *)(aperture+4096),0));
+    assert(prt_callbacks==before_callbacks);
+    runtime_memory_set_prt_hook(prt_hook);
+    assert(prt_callbacks==before_callbacks+PRT_APERTURES && !observed_prt[0].size && !observed_prt[1].size);
+    runtime_memory_set_prt_hook(NULL);
+    puts("PASS: PRT state, GPU hook replay, two real physical aliases, sparse holes and checked release");
+}
+
+static void test_checked_and_unchecked_release(void) {
+    int64_t physical;
+    assert(!direct_allocate(0,POOL_SIZE,3*PAGE,PAGE,0,&physical));
+    void *memory=NULL;
+    assert(!direct_map(&memory,3*PAGE,3,0,physical,PAGE));
+    memset(memory,0x27,3*PAGE);
+    assert(!direct_checked_release(physical+PAGE,PAGE));
+    size_t before_vmas=vma_count;
+    uint64_t before_live=live_bytes;
+    assert(direct_checked_release(physical,3*PAGE)==NOT_FOUND);
+    assert(vma_count==before_vmas && live_bytes==before_live && *(unsigned char *)memory==0x27);
+    assert(!direct_release(physical,3*PAGE)); /* Unchecked free ignores the middle hole. */
+    assert(!direct_release(POOL_SIZE,PAGE) && !direct_release(UINT64_MAX-PAGE+1,PAGE));
+    assert(!vma_count && !live_bytes);
+
+    /* The finite allocation table cannot lose a right-hand physical fragment
+     * when releasing an interior range with no spare metadata slot. */
+    assert(!direct_allocate(0,POOL_SIZE,3*PAGE,PAGE,0,&physical));
+    memory=NULL;
+    assert(!direct_map(&memory,3*PAGE,3,0,physical,PAGE));
+    memset(memory,0x54,3*PAGE);
+    Block saved[LIMIT];
+    memcpy(saved,blocks,sizeof(saved));
+    for (int i=0;i<LIMIT;++i) if (!blocks[i].used) blocks[i]=(Block){POOL_SIZE,0,0,1};
+    before_vmas=vma_count; before_live=live_bytes;
+    assert(direct_checked_release(physical+PAGE,PAGE)==NO_MEMORY);
+    assert(vma_count==before_vmas && live_bytes==before_live);
+    assert(((unsigned char *)memory)[PAGE]==0x54 && ((unsigned char *)memory)[2*PAGE]==0x54);
+    memcpy(blocks,saved,sizeof(saved));
+    assert(!direct_checked_release(physical,3*PAGE));
+    assert(!vma_count && !live_bytes);
+    puts("PASS: checked free is atomic on missing physical pages and allocation-table exhaustion");
+}
+
 int main(void) {
     setbuf(stdout,NULL);
     setenv("BB_DMEM_MB","5056",1);
@@ -261,6 +422,8 @@ int main(void) {
     test_driveclub_boot_replay();
     test_host_collisions_and_alias_release();
     test_reservations_and_metadata_failure();
+    test_prt_contract_and_driveclub_aliases();
+    test_checked_and_unchecked_release();
     puts("PASS: virtual memory allocation, names, queries, bounds, aliases and backing offsets");
     return 0;
 }

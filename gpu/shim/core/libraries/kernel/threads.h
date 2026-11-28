@@ -9,10 +9,12 @@
 #include <stop_token>
 #include <system_error>
 #include <thread>
+#include "../../../../../src/guest_cpu.h"
 #include "common/types.h"
 #include "core/libraries/kernel/threads/pthread.h"
 
 extern "C" void runtime_thread_attach_host(const char* name);
+extern "C" void runtime_thread_cleanup(void);
 
 namespace Libraries::Kernel {
 class Thread {
@@ -24,6 +26,12 @@ public:
         thread = std::jthread([func = std::move(func), done = finished](std::stop_token stop) {
             runtime_thread_attach_host("bb:hle");
             func(stop);
+            // TLS destructors may call guest code: run them before FEX cleanup.
+            runtime_thread_cleanup();
+            // Decoder threads own the FEX context created by attach_host too.
+            // Release its JIT state and call-return stack before the thread exits,
+            // just as the runtime does for threads created by the game.
+            guest_cpu_thread_end();
             done->store(true);
         });
     }

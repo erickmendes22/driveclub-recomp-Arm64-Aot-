@@ -1,8 +1,14 @@
 // Run against the Bionic ARM64 CPU library extracted from the actual APK.
 #include "../src/guest_cpu.h"
+#include "../src/runtime_exit.h"
+#include "guest_setcontext_contract.h"
 extern "C" {
 #include "../src/runtime.h"
 int runtime_memory_read_backing(uintptr_t address, void* data, uint64_t size);
+// The test supplies a synthetic image and does not perform save transactions.
+uintptr_t runtime_image_base;
+uint64_t runtime_image_size;
+int runtime_savedata_busy(void) { return 0; }
 }
 #include <array>
 #include <cerrno>
@@ -17,6 +23,12 @@ int runtime_memory_read_backing(uintptr_t address, void* data, uint64_t size);
 // It does not simulate FEX or any of the successful mappings/copies.
 static bool restrict_guest_maps_to_39_bits;
 static unsigned rejected_high_maps;
+static uint64_t guest_bridge_calls;
+extern "C" uint64_t __real_guest_cpu_call(uintptr_t, unsigned, const uint64_t*);
+extern "C" uint64_t __wrap_guest_cpu_call(uintptr_t address, unsigned count, const uint64_t* args) {
+    ++guest_bridge_calls;
+    return __real_guest_cpu_call(address, count, args);
+}
 extern "C" void* __real_mmap(void*, size_t, int, int, int, off_t);
 extern "C" void* __wrap_mmap(void* address, size_t size, int prot, int flags, int fd, off_t offset) {
     constexpr uintptr_t ceiling = uint64_t{1} << 39;
@@ -155,6 +167,15 @@ bool test_boot_heaps(unsigned char* guest) {
 
     // The fixed scratch alias at 64 GiB must still be available and must share
     // the direct allocation's physical backing with the relocated Magic heap.
+    struct PrtResult { void* base; uint64_t size; };
+    auto* prt = reinterpret_cast<PrtResult*>(guest + 896);
+    if (!expect("FEX sets sparse PRT aperture",call_memory("sceKernelSetPrtAperture",
+                {0,0x1000000000,2*mib+page}),0)
+            || !expect("FEX queries sparse PRT aperture",call_memory("sceKernelGetPrtAperture",
+                {0,pointer(&prt->base),pointer(&prt->size)}),0)
+            || !expect("PRT returned guest base",pointer(prt->base),0x1000000000)
+            || !expect("PRT returned guest length",prt->size,2*mib+page)
+            || !expect("PRT does not invent CPU backing",runtime_memory_is_mapped(0x1000000000,1),0)) return false;
     auto** alias = reinterpret_cast<void**>(guest + 640);
     *alias = reinterpret_cast<void*>(0x1000000000);
     if (!expect("fixed scratch alias remains at 64 GiB",call_memory("sceKernelMapDirectMemory",
@@ -163,14 +184,95 @@ bool test_boot_heaps(unsigned char* guest) {
     std::memcpy(globals->magic,&value,sizeof(value));
     std::memcpy(&backing,*alias,sizeof(backing));
     if (!expect("fixed scratch alias shares relocated direct backing",backing,value)) return false;
+    if (!expect("FEX clears PRT coverage",call_memory("sceKernelSetPrtAperture",
+                {0,0x1000000000,0}),0)
+            || !expect("clearing PRT preserves physical backing",runtime_memory_is_mapped(0x1000000000,page),1)) return false;
     for (unsigned i = 0; i < 3; ++i)
-        if (!expect("FEX releases direct allocation and aliases",call_memory("sceKernelReleaseDirectMemory",
+        if (!expect("FEX releases direct allocation and aliases",call_memory(i==2 ? "sceKernelCheckedReleaseDirectMemory" : "sceKernelReleaseDirectMemory",
                 {static_cast<uint64_t>(globals->physical[i]),sizes[i]}),0)) return false;
     if (!expect("released fixed alias no longer mapped",runtime_memory_is_mapped(pointer(*alias),page),0)
             || !expect("FEX releases relocated flexible heap",call_memory("sceKernelReleaseFlexibleMemory",
                     {flex,338*mib}),0)) return false;
     restrict_guest_maps_to_39_bits = false;
     return true;
+}
+
+bool test_exit_guest_bridges() {
+    // Only signatures checked by the production installer and small, synthetic
+    // x86 functions are present. No game asset or executable is required.
+    constexpr size_t image_size = 26 * 1024 * 1024;
+    auto* image = static_cast<unsigned char*>(runtime_low_map(image_size, PROT_READ | PROT_WRITE));
+    if (!image) return false;
+    runtime_image_base = reinterpret_cast<uintptr_t>(image);
+    runtime_image_size = image_size;
+    constexpr size_t predicate_offset = 0x5008f0, region_offset = 0x15585c4;
+    constexpr size_t destructor_offset = 0xea24d0, webapi_offset = 0x7d6e70;
+    const unsigned char predicate[] = {
+        0x48,0x8d,0x05,0xcd,0x7c,0x05,0x01,0x8b,0x00,0x83,0xf8,0x02,0x74,0x05,
+        0x83,0xf8,0x04,0x75,0x03,0xb0,0x01,0xc3,0x83,0xf8,0x05,0x0f,0x94,0xc0,0xc3};
+    const unsigned char prologue[] = {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,
+        0x41,0x55,0x41,0x54,0x53,0x48,0x83,0xec,0x68};
+    const unsigned char first_connection[] = {0x48,0x8b,0x43,0x28,0x48,0x83,0xf8,0xff,0x74,0x3a};
+    const unsigned char second_connection[] = {0x48,0x8b,0x43,0x38,0x48,0x83,0xf8,0xff,0x74,0x3a};
+    // Increment the supplied counter, then undo the complete original prologue.
+    const unsigned char destructor_body[] = {0x48,0xff,0x07,0x48,0x83,0xc4,0x68,0x5b,
+        0x41,0x5c,0x41,0x5d,0x41,0x5e,0x41,0x5f,0x5d,0xc3};
+    const unsigned char webapi[] = {0x4c,0x89,0xff,0xe8,0xa8,0x05,0,0,
+        0x4c,0x89,0xff,0xe8,0x90,0xf9,0xff,0xff,0xc3};
+    const unsigned char cleanup[] = {0xff,0x07,0xc3}; // inc dword [rdi]; ret
+    const unsigned char retry[] = {0xff,0x47,0x04,0xb8,0x01,0x00,0x00,0x00,0xc3};
+    unsigned char webapi_caller[] = {0x41,0x57,0x48,0x83,0xec,0x08,0x49,0x89,0xff,
+        0xe8,0,0,0,0,0x48,0x83,0xc4,0x08,0x41,0x5f,0xc3};
+    const int32_t call_displacement = static_cast<int32_t>(webapi_offset - (0x1000 + 14));
+    std::memcpy(webapi_caller + 10, &call_displacement, sizeof(call_displacement));
+    std::memcpy(image + predicate_offset, predicate, sizeof(predicate));
+    std::memcpy(image + destructor_offset, prologue, sizeof(prologue));
+    std::memcpy(image + destructor_offset + sizeof(prologue), destructor_body, sizeof(destructor_body));
+    std::memcpy(image + 0xea24f3, first_connection, sizeof(first_connection));
+    std::memcpy(image + 0xea2537, second_connection, sizeof(second_connection));
+    std::memcpy(image + webapi_offset, webapi, sizeof(webapi));
+    std::memcpy(image + 0x7d7420, cleanup, sizeof(cleanup));
+    std::memcpy(image + 0x7d6810, retry, sizeof(retry));
+    std::memcpy(image + 0x1000, webapi_caller, sizeof(webapi_caller));
+    if (mprotect(image, image_size, PROT_READ | PROT_WRITE | PROT_EXEC)) return false;
+    guest_cpu_code(runtime_image_base, image_size);
+    auto* counter = reinterpret_cast<uint64_t*>(image + 0x10000);
+    const uint64_t object = reinterpret_cast<uintptr_t>(counter);
+    // Warm the original translation. The installer's invalidation is required
+    // for the subsequent call to visit close_stream and its guest trampoline.
+    guest_cpu_call(runtime_image_base + destructor_offset, 1, &object);
+    if (!expect("unpatched synthetic stream destructor", *counter, 1)) return false;
+    runtime_exit_initialize();
+    if (!expect("stream shutdown hook installed", image[destructor_offset], 0x48)
+            || !expect("WebAPI shutdown hook installed", image[webapi_offset + 3], 0x48)) return false;
+    const uint64_t bridge_before = guest_bridge_calls;
+    guest_cpu_call(runtime_image_base + destructor_offset, 1, &object);
+    if (!expect("stream destructor preserves original body", *counter, 2)
+            || !expect("stream shutdown re-enters guest CPU after invalidation",
+                guest_bridge_calls - bridge_before, 2)) return false;
+    struct RegionCase { uint32_t region, button; };
+    for (const auto& item : {RegionCase{2,0x2000}, RegionCase{4,0x2000},
+                            RegionCase{5,0x2000}, RegionCase{0x100,0x4000}}) {
+        std::memcpy(image + region_offset, &item.region, sizeof(item.region));
+        runtime_exit_tick();
+        if (!expect("regional confirm predicate uses guest CPU and AL result",
+                runtime_exit_confirm_button(), item.button)) return false;
+    }
+    auto* manager = image + 0x11000;
+    const uint64_t manager_argument = reinterpret_cast<uintptr_t>(manager);
+    auto* counts = reinterpret_cast<uint32_t*>(manager);
+    if (!expect("WebAPI retry calls guest cleanup and initialization",
+                guest_cpu_call(runtime_image_base + 0x1000, 1, &manager_argument) & 0xff, 1)
+            || !expect("WebAPI cleanup count before stop", counts[0], 1)
+            || !expect("WebAPI initialization count before stop", counts[1], 1)) return false;
+    manager[0x21] = 1;
+    if (!expect("WebAPI stop request leaves retry loop",
+                guest_cpu_call(runtime_image_base + 0x1000, 1, &manager_argument) & 0xff, 1)
+            || !expect("WebAPI cleanup retained on stop", counts[0], 2)
+            || !expect("WebAPI initialization skipped on stop", counts[1], 1)) return false;
+    guest_cpu_code_changed(runtime_image_base, image_size);
+    runtime_image_base = runtime_image_size = 0;
+    return munmap(image, image_size) == 0;
 }
 } // namespace
 
@@ -190,6 +292,10 @@ int main() {
     guest_cpu_init(runtime_low_map);
     auto page_size = static_cast<size_t>(sysconf(_SC_PAGESIZE));
     std::printf("FEX test host page size: %zu bytes\n", page_size);
+#ifdef DRIVECLUB_NATIVE_EXIT_TEST
+    std::puts("Native x86-64 synthetic exit-hook test; ARM64 FEX is verified separately.");
+    return test_exit_guest_bridges() ? 0 : 8;
+#endif
     auto* guest = static_cast<unsigned char*>(runtime_low_map(page_size, PROT_READ | PROT_WRITE));
     if (!guest || reinterpret_cast<uintptr_t>(guest) >= (uint64_t{1} << 40)
             || reinterpret_cast<uintptr_t>(guest) % page_size) return 1;
@@ -231,7 +337,11 @@ int main() {
     if (!expect("native thunk calling back into guest code",
                 guest_cpu_call(callback_thunk, 1, &callback_arg), 42)) return 6;
     if (!test_boot_heaps(guest)) return 7;
+    if (!test_exit_guest_bridges()) return 8;
+    auto* context_memory = static_cast<unsigned char*>(runtime_low_map(16384,PROT_READ|PROT_WRITE|PROT_EXEC));
+    if (!test_guest_setcontext_contract(context_memory,16384)) return 9;
+    if (runtime_low_unmap(context_memory,16384)) return 9;
     guest_cpu_thread_end();
-    std::puts("FEX passed the packaged Bionic ARM64 ABI, code invalidation and 39-bit heap regression checks.");
+    std::puts("FEX passed the packaged Bionic ARM64 ABI, 39-bit heaps, PRT, controls, shutdown and libunwind regressions.");
     return 0;
 }

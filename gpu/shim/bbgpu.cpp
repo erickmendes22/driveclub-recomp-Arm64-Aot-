@@ -60,15 +60,20 @@ uint64_t runtime_process_time_counter(void);
 uint64_t runtime_tsc_frequency(void);
 int32_t* runtime_errno(void);
 void runtime_memory_set_gpu_hooks(RuntimeGpuRange map, RuntimeGpuRange unmap, RuntimeGpuRange invalidate);
+void runtime_memory_set_prt_hook(void (*hook)(unsigned id, uintptr_t address, uint64_t size));
 }
 
 Frontend::WindowSDL* g_window = nullptr;
 static std::atomic<bool> g_gpu_shutdown_complete{false};
 
-namespace Libraries::GnmDriver { void RegisterLib(Core::Loader::SymbolsResolver* sym); }
+namespace Libraries::GnmDriver {
+void RegisterLib(Core::Loader::SymbolsResolver* sym);
+void Initialize();
+}
 namespace Libraries::AvPlayer { void RegisterLib(Core::Loader::SymbolsResolver* sym); }
 namespace Libraries::VideoOut {
 void RegisterLib(Core::Loader::SymbolsResolver* sym);
+void Initialize();
 void StopPresenting();
 void Shutdown();
 }
@@ -109,6 +114,7 @@ public:
 
 void MemoryManager::SetRasterizer(Vulkan::Rasterizer* rasterizer_) {
     if (!rasterizer_) {
+        runtime_memory_set_prt_hook(nullptr);
         runtime_memory_set_gpu_hooks(nullptr,nullptr,nullptr);
         rasterizer=nullptr;
         return;
@@ -126,6 +132,12 @@ void MemoryManager::SetRasterizer(Vulkan::Rasterizer* rasterizer_) {
         [](uintptr_t address, uint64_t size) {
             Memory::Instance()->GetRasterizer()->InvalidateMemory(address, size);
         });
+    // PRT apertures describe sparse GPU address ranges, not host-backed pages.
+    // Installing this hook replays the three slots without registering holes
+    // with the CPU page tracker or creating host mappings for them.
+    runtime_memory_set_prt_hook([](unsigned id, uintptr_t address, uint64_t size) {
+        Memory::Instance()->GetRasterizer()->SetPrtAperture(id, address, size);
+    });
 }
 void MemoryManager::InvalidateMemory(VAddr address, u64 size) {
     if (rasterizer) rasterizer->InvalidateMemory(address, size);
@@ -341,10 +353,10 @@ extern "C" int bbgpu_init(const BbGpuConfig* config) {
         std::unique_lock lock{g_window_mutex};
         g_window_cv.wait(lock, [] { return g_window_ready; });
     }
-    Core::Loader::SymbolsResolver resolver;
+    bbgpu_register_libraries();
     // GnmDriver creates the presenter that the VideoOut present thread uses.
-    Libraries::GnmDriver::RegisterLib(&resolver);
-    Libraries::VideoOut::RegisterLib(&resolver);
+    Libraries::GnmDriver::Initialize();
+    Libraries::VideoOut::Initialize();
     return 0;
 }
 
@@ -372,14 +384,35 @@ extern "C" void bbgpu_shutdown(void) {
 namespace Libraries::Kernel { void StartKernelService(); }
 namespace Libraries::Videodec { void RegisterLib(Core::Loader::SymbolsResolver* sym); }
 extern "C" void bbnet_register(void); // bbnet/bbnet_glue.cpp: network and PSN (co-op)
+extern "C" void bbnet_register_symbols(void);
+static void RegisterCommonLibraries() {
+    static std::once_flag registered;
+    std::call_once(registered, [] {
+        Core::Loader::SymbolsResolver resolver;
+        Libraries::Kernel::RegisterEventQueue(&resolver);
+        Libraries::AvPlayer::RegisterLib(&resolver);
+        Libraries::Videodec::RegisterLib(&resolver);
+        bbnet_register_symbols();
+    });
+}
+extern "C" void bbgpu_register_libraries(void) {
+    RegisterCommonLibraries();
+    static std::once_flag registered;
+    std::call_once(registered, [] {
+        Core::Loader::SymbolsResolver resolver;
+        Libraries::GnmDriver::RegisterLib(&resolver);
+        Libraries::VideoOut::RegisterLib(&resolver);
+    });
+}
 extern "C" void bbgpu_register_kernel(void) {
-    Libraries::Kernel::StartKernelService();
-    Core::Loader::SymbolsResolver resolver;
-    Libraries::Kernel::RegisterEventQueue(&resolver);
-    Libraries::AvPlayer::RegisterLib(&resolver);
-    // inFAMOUS Second Son plays its .bsf movies through libSceVideodec (FFmpeg-backed).
-    Libraries::Videodec::RegisterLib(&resolver);
-    bbnet_register();
+    // CPU-only execution must retain unresolved traps for renderer calls:
+    // their entry points require the device created by bbgpu_init.
+    RegisterCommonLibraries();
+    static std::once_flag started;
+    std::call_once(started, [] {
+        Libraries::Kernel::StartKernelService();
+        bbnet_register();
+    });
 }
 
 extern "C" uintptr_t bbgpu_resolve(const char* scoped_nid) {

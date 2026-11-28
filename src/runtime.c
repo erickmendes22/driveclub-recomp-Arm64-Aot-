@@ -9,6 +9,9 @@
 #include <stdatomic.h>
 #include <sched.h>
 #include <pthread.h>
+#ifndef _WIN32
+#include <sys/mman.h>
+#endif
 
 typedef struct {
     union { GuestCallback plain; void (ABI *with_arg)(void *); } callback;
@@ -25,6 +28,7 @@ static _Atomic size_t memory_calls;
 #define TLS_MODULES 16
 static struct { const void *data; uint64_t filesz, memsz; } tls_modules[TLS_MODULES];
 static _Thread_local unsigned char *tls_blocks[TLS_MODULES];
+static _Thread_local size_t tls_block_sizes[TLS_MODULES];
 static void *process_param;
 void runtime_set_procparam(void *param) { process_param=param; }
 static ABI void *guest_procparam(void) { return process_param; }
@@ -36,6 +40,7 @@ static ABI void guest_set_heap_api(void **api) {
 void **runtime_application_heap_api(void) { return application_heap_api; }
 void runtime_set_module_tls(uint64_t module, const void *data, uint64_t filesz, uint64_t memsz) {
     if (module<2 || module>=TLS_MODULES) { fputs("STOP: unsupported TLS module id\n",stderr); exit(21); }
+    if (!data || filesz>memsz || memsz>SIZE_MAX) { fputs("STOP: invalid module TLS template\n",stderr); exit(21); }
     tls_modules[module].data=data; tls_modules[module].filesz=filesz; tls_modules[module].memsz=memsz;
 }
 void runtime_set_libc_tls(const void *data, uint64_t filesz, uint64_t memsz) { runtime_set_module_tls(2,data,filesz,memsz); }
@@ -45,11 +50,23 @@ static ABI void *guest_tls_get_addr(const uint64_t *index) {
     }
     unsigned char **block=&tls_blocks[index[0]];
     if (!*block) {
-        *block=calloc(1,tls_modules[index[0]].memsz);
+        *block=runtime_low_map((size_t)tls_modules[index[0]].memsz,PROT_READ|PROT_WRITE);
         if (!*block) { fputs("Cannot allocate module TLS\n",stderr); exit(1); }
+        tls_block_sizes[index[0]]=(size_t)tls_modules[index[0]].memsz;
         memcpy(*block,tls_modules[index[0]].data,tls_modules[index[0]].filesz);
     }
     return *block+index[1];
+}
+void runtime_tls_cleanup(void) {
+    for (unsigned i=2;i<TLS_MODULES;++i) {
+        if (!tls_blocks[i]) continue;
+        if (runtime_low_unmap(tls_blocks[i],tls_block_sizes[i])) {
+            perror("Cannot release module TLS");
+            continue;
+        }
+        tls_blocks[i]=NULL;
+        tls_block_sizes[i]=0;
+    }
 }
 
 void runtime_start(uint64_t flags) {
@@ -275,6 +292,7 @@ uintptr_t runtime_resolve(const char *name, int is_data) {
     if (nid_match(name, "vNe1w4diLCs#p#J")) return (uintptr_t)guest_tls_get_addr;
     if (nid_match(name, "959qrazPIrg#p#J")) return (uintptr_t)guest_procparam;
     if (nid_match(name, "p5EcQeEeJAE#p#J")) return (uintptr_t)guest_set_heap_api;
+    if (nid_match(name, "OjWstbIRPUo")) return (uintptr_t)guest_cpu_libunwind_setcontext;
     uintptr_t mutex = runtime_mutex_resolve(name);
     if (mutex) return mutex;
     uintptr_t thread = runtime_thread_resolve(name);
@@ -301,6 +319,10 @@ uintptr_t runtime_resolve(const char *name, int is_data) {
     if (audio) return audio;
     uintptr_t pad = runtime_pad_resolve(name);
     if (pad) return pad;
+    uintptr_t usbd = runtime_usbd_resolve(name);
+    if (usbd) return usbd;
+    uintptr_t capture = runtime_capture_resolve(name);
+    if (capture) return capture;
     uintptr_t rtc = runtime_rtc_resolve(name);
     if (rtc) return rtc;
     uintptr_t save = runtime_savedata_resolve(name);

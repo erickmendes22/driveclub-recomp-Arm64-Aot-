@@ -53,6 +53,7 @@ static uint64_t pool_size_bytes(void) {
 #define ACCESS ((int32_t)UINT32_C(0x8002000d))
 #define NO_SPACE ((int32_t)UINT32_C(0x80020023))
 #define BAD_ADDRESS ((int32_t)UINT32_C(0x8002000e))
+#define NOT_FOUND ((int32_t)UINT32_C(0x80020002))
 #define NAME_TOO_LONG ((int32_t)UINT32_C(0x8002003f))
 #define MAP_FIXED_FLAG 0x10
 #define MAP_NO_OVERWRITE 0x80
@@ -154,6 +155,20 @@ typedef struct { int kind; uintptr_t address; uint64_t size; } PendingHook;
 static PendingHook pending[64]; static size_t pending_count;
 static size_t allocations, maps, flexible_maps, protects, queries;
 static uint64_t live_bytes, flexible_bytes;
+/* A PRT aperture describes sparse GPU address space, not a CPU mapping or a
+ * physical allocation. The backing pages are installed separately by
+ * MapDirectMemory (Driveclub uses fixed aliases starting at 64 GiB).
+ * OpenOrbis declares Set/GetPrtAperture with this ABI. shadPS4's kernel
+ * memory.cpp uses three slots, 4 KiB base alignment and this user VA range;
+ * its MemoryManager::SetPrtArea registers sparse GPU coverage separately. */
+enum { PRT_APERTURES=3 };
+typedef struct { uintptr_t address; uint64_t size; } PrtAperture;
+typedef void (*GpuPrtAperture)(unsigned id, uintptr_t address, uint64_t size);
+static PrtAperture prt_apertures[PRT_APERTURES];
+static GpuPrtAperture hook_prt;
+/* Serialize publication and callback/replay, while allowing the renderer to
+ * query VMAs from a callback without holding the memory table writer lock. */
+static pthread_mutex_t prt_mutex=PTHREAD_MUTEX_INITIALIZER;
 /* A refused memory request is logged (the first dozen), so a crash that follows it can be explained. */
 static int32_t mem_fail(int32_t code, int line) {
     static volatile long reported[2048]; /* three per place: the game probes some requests on purpose */
@@ -581,6 +596,7 @@ static int block_type(uint64_t phys) {
     return -1;
 }
 static int direct_range_allocated(uint64_t phys, uint64_t size) {
+    if (phys>POOL_SIZE || size>POOL_SIZE-phys) return 0;
     for (uint64_t at=phys; at<phys+size;) {
         int found=0;
         for (int i=0;i<LIMIT;++i) if (blocks[i].used && at>=blocks[i].start && at-blocks[i].start<blocks[i].size) {
@@ -589,6 +605,45 @@ static int direct_range_allocated(uint64_t phys, uint64_t size) {
         if (!found) return 0;
     }
     return 1;
+}
+
+static ABI int32_t set_prt_aperture(int32_t id, void *base, uint64_t size) {
+    uintptr_t address=(uintptr_t)base;
+    if (id<0 || id>=PRT_APERTURES || address<USER_MIN || address>USER_MAX ||
+        address%4096 || size>USER_MAX-address) return INVALID;
+    pthread_mutex_lock(&prt_mutex);
+    write_lock();
+    PrtAperture previous=prt_apertures[id];
+    prt_apertures[id]=(PrtAperture){address,size};
+    write_unlock();
+    if (previous.address!=address || previous.size!=size) {
+        if (hook_prt) hook_prt((unsigned)id,address,size);
+        printf("Runtime: PRT aperture %d address=0x%" PRIxPTR ", bytes=%" PRIu64
+               " (sparse GPU range; backing mapped separately)\n",id,address,size);
+    }
+    pthread_mutex_unlock(&prt_mutex);
+    return 0;
+}
+static ABI int32_t get_prt_aperture(int32_t id, void **address, uint64_t *size) {
+    if (id<0 || id>=PRT_APERTURES || !address || !size) return INVALID;
+    read_lock();
+    PrtAperture aperture=prt_apertures[id];
+    read_unlock();
+    *address=(void *)aperture.address;
+    *size=aperture.size;
+    return 0;
+}
+void runtime_memory_set_prt_hook(GpuPrtAperture hook) {
+    pthread_mutex_lock(&prt_mutex);
+    hook_prt=hook;
+    if (hook) {
+        PrtAperture snapshot[PRT_APERTURES];
+        read_lock();
+        memcpy(snapshot,prt_apertures,sizeof(snapshot));
+        read_unlock();
+        for (unsigned i=0;i<PRT_APERTURES;++i) hook(i,snapshot[i].address,snapshot[i].size);
+    }
+    pthread_mutex_unlock(&prt_mutex);
 }
 
 static ABI uint64_t direct_size(void) { return POOL_SIZE; }
@@ -643,8 +698,13 @@ static ABI int32_t direct_map_named(void **out, uint64_t size, int prot, int fla
     (void)name; return direct_map(out,size,prot,flags,physical,alignment);
 }
 static int32_t unmap_locked(uintptr_t start, uint64_t size) {
-    if (start%PAGE || !size) return INVALID;
-    uint64_t end=start+align_up(size,PAGE);
+    if (start%PAGE || !size || size>UINT64_MAX-(PAGE-1)) return INVALID;
+    size=align_up(size,PAGE);
+    if (size>UINTPTR_MAX-start) return INVALID;
+    uint64_t end=start+size;
+    /* An interior unmap can split both boundary VMAs. Obtain the metadata
+     * before changing host mappings, just as the map path does. */
+    if (vma_count>SIZE_MAX-2 || vma_reserve(vma_count+2)) return mem_fail(NO_MEMORY,__LINE__);
     for (size_t i=vma_index(start); i<vma_count && vmas[i].start<end; ++i)
         if (vmas[i].kind!=KIND_RESERVED) {
             uintptr_t a=vmas[i].start>start ? vmas[i].start : start, b=vmas[i].end<end ? vmas[i].end : end;
@@ -659,7 +719,9 @@ static int32_t unmap_locked(uintptr_t start, uint64_t size) {
 }
 static ABI int32_t direct_unmap(void *address, uint64_t size) {
     /* The GPU forgets the range before it disappears (as shadPS4's early GPU unmap). */
-    if (hook_unmap && !((uintptr_t)address%PAGE) && size) hook_unmap((uintptr_t)address,align_up(size,PAGE));
+    if ((uintptr_t)address%PAGE || !size || size>UINT64_MAX-(PAGE-1) ||
+        align_up(size,PAGE)>UINTPTR_MAX-(uintptr_t)address) return INVALID;
+    if (hook_unmap) hook_unmap((uintptr_t)address,align_up(size,PAGE));
     write_lock();
     size_t before=pending_count;
     int32_t result=unmap_locked((uintptr_t)address,size);
@@ -667,18 +729,39 @@ static ABI int32_t direct_unmap(void *address, uint64_t size) {
     write_unlock();
     return result;
 }
-static ABI int32_t direct_release(uint64_t start, uint64_t size) {
-    if (start % PAGE || size % PAGE) return INVALID;
-    if (!size) return 0;
-    write_lock();
-    if (!direct_range_allocated(start,size)) { write_unlock(); return INVALID; }
+/* CheckedReleaseDirectMemory validates the complete physical interval before
+ * releasing anything (ENOENT on an unallocated page). The unchecked variant
+ * releases the allocated portions and ignores free/out-of-pool space, matching
+ * shadPS4 MemoryManager::Free's checked/unchecked distinction. */
+static int32_t direct_release_locked(uint64_t start, uint64_t size, int checked) {
+    if (checked && !direct_range_allocated(start,size)) return NOT_FOUND;
+    if (start>=POOL_SIZE) return checked ? NOT_FOUND : 0;
+    if (size>POOL_SIZE-start) size=POOL_SIZE-start;
+    const uint64_t end=start+size;
+    unsigned free_blocks=0, extra_blocks=0;
+    for (int i=0;i<LIMIT;++i) {
+        const Block *b=&blocks[i];
+        if (!b->used) ++free_blocks;
+        else if (b->start<start && end<b->start+b->size) ++extra_blocks;
+    }
+    if (extra_blocks>free_blocks) return mem_fail(NO_MEMORY,__LINE__);
+    size_t aliases=0;
+    for (size_t i=0;i<vma_count;++i) {
+        const Vma *v=&vmas[i];
+        if (v->kind==KIND_DIRECT && v->phys<end && start<v->phys+v->end-v->start) ++aliases;
+    }
+    /* Each partially released alias can leave two edges. Reserve metadata for
+     * every alias before the first unmap, including fragmented physical blocks. */
+    if (aliases>(SIZE_MAX-vma_count)/2 || vma_reserve(vma_count+2*aliases))
+        return mem_fail(NO_MEMORY,__LINE__);
     /* Mappings of released physical pages disappear with them. */
     for (size_t i=0; i<vma_count;) {
         Vma v=vmas[i];
         uint64_t length=v.end-v.start;
-        if (v.kind==KIND_DIRECT && v.phys<start+size && start<v.phys+length) {
-            uint64_t a=v.phys>start ? v.phys : start, b=v.phys+length<start+size ? v.phys+length : start+size;
-            unmap_locked(v.start+(a-v.phys),b-a);
+        if (v.kind==KIND_DIRECT && v.phys<end && start<v.phys+length) {
+            uint64_t a=v.phys>start ? v.phys : start, b=v.phys+length<end ? v.phys+length : end;
+            int32_t result=unmap_locked(v.start+(a-v.phys),b-a);
+            if (result) return result;
             i=vma_index(v.start);
             continue;
         }
@@ -686,8 +769,8 @@ static ABI int32_t direct_release(uint64_t start, uint64_t size) {
     }
     for (int i=0; i<LIMIT; ++i) {
         Block *b=&blocks[i];
-        if (!b->used || b->start>=start+size || start>=b->start+b->size) continue;
-        uint64_t a=b->start>start ? b->start : start, e=b->start+b->size<start+size ? b->start+b->size : start+size;
+        if (!b->used || b->start>=end || start>=b->start+b->size) continue;
+        uint64_t a=b->start>start ? b->start : start, e=b->start+b->size<end ? b->start+b->size : end;
         Block left=*b, right=*b;
         left.size=a-b->start; right.start=e; right.size=b->start+b->size-e;
         b->used=0;
@@ -696,10 +779,19 @@ static ABI int32_t direct_release(uint64_t start, uint64_t size) {
         live_bytes-=e-a;
     }
     host_discard(start,size); /* zero on reuse */
-    write_unlock();
-    flush_hooks();
     return 0;
 }
+static int32_t release_direct(uint64_t start, uint64_t size, int checked) {
+    if (start%PAGE || size%PAGE) return INVALID;
+    if (!size) return 0;
+    write_lock();
+    int32_t result=direct_release_locked(start,size,checked);
+    write_unlock();
+    flush_hooks();
+    return result;
+}
+static ABI int32_t direct_release(uint64_t start, uint64_t size) { return release_direct(start,size,0); }
+static ABI int32_t direct_checked_release(uint64_t start, uint64_t size) { return release_direct(start,size,1); }
 static int32_t map_flexible_locked(void **inout, uint64_t size, int prot, int flags) {
     if (!inout || !size || size%PAGE || (prot & ~0x37)) return INVALID;
     if (flexible_bytes+size>FLEXIBLE_SIZE || pool()) return mem_fail(NO_MEMORY, __LINE__);
@@ -877,6 +969,8 @@ static const RuntimeExport exports[]={
     {"sceKernelGetDirectMemorySize",direct_size}, {"sceKernelAllocateDirectMemory",direct_allocate},
     {"sceKernelMapDirectMemory",direct_map}, {"sceKernelMapNamedDirectMemory",direct_map_named},
     {"sceKernelReleaseDirectMemory",direct_release}, {"sceKernelMunmap",direct_unmap}, {"munmap",direct_unmap},
+    {"sceKernelCheckedReleaseDirectMemory",direct_checked_release},
+    {"sceKernelSetPrtAperture",set_prt_aperture}, {"sceKernelGetPrtAperture",get_prt_aperture},
     {"sceKernelMapFlexibleMemory",map_flexible}, {"sceKernelMapNamedFlexibleMemory",map_flexible_named},
     {"sceKernelReleaseFlexibleMemory",release_flexible}, {"sceKernelReserveVirtualRange",reserve_range},
     {"sceKernelMprotect",kernel_mprotect}, {"sceKernelQueryMemoryProtection",query_protection},
@@ -890,6 +984,9 @@ uintptr_t runtime_memory_resolve(const char *name) {
     if (nid_match(name, "rTXw65xmLIA#p#J")) return (uintptr_t)direct_allocate;
     if (nid_match(name, "L-Q3LEjIbgA#p#J")) return (uintptr_t)direct_map;
     if (nid_match(name, "MBuItvba6z8#p#J")) return (uintptr_t)direct_release;
+    if (nid_match(name, "hwVSPCmp5tM")) return (uintptr_t)direct_checked_release;
+    if (nid_match(name, "BohYr-F7-is")) return (uintptr_t)set_prt_aperture;
+    if (nid_match(name, "L0v2Go5jOuM")) return (uintptr_t)get_prt_aperture;
     if (nid_match(name, "cQke9UuBQOk#p#J")) return (uintptr_t)direct_unmap;
     if (nid_match(name, "DGMG3JshrZU")) return (uintptr_t)set_virtual_range_name;
     if (nid_match(name, "mkgXxsoxWHg")) return (uintptr_t)clear_virtual_range_name;
