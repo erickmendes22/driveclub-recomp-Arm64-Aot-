@@ -218,8 +218,9 @@ To record a new profile after the code has changed a lot: build with `BB_PGO=gen
 The Android 0.6 target integrates the local preparer, Driveclub loader/HLE, FEXCore,
 the existing shadPS4-based renderer, local FPKG installation, a bundled Turnip
 selector and analogue touch controls. It targets `arm64-v8a`, Android 11/API 30
-or later, using Bionic throughout. The 0.5 APK audit, seven host PKG tests,
-six Android integration tests and five native ARM64/Bionic FEX checks passed.
+or later, using Bionic throughout. The 0.6 APK audit, seven host PKG tests,
+six Android integration tests and native ARM64/Bionic FEX ABI and heap-regression
+checks passed.
 Building the APK or passing synthetic tests does not
 establish that the original game reaches its menu or gameplay; that requires an
 Android device run with the user's game files and its startup log.
@@ -408,6 +409,19 @@ Vulkan probe alone does not prove that those renderer requirements are satisfied
 ### Verification
 
 #### Android 0.6 memory regression
+
+All three jobs passed in the
+[0.6 validation run](https://github.com/erickmendes22/driveclub-recomp-Arm64-Aot-/actions/runs/46088122623):
+the [ARM64 APK audit](https://github.com/erickmendes22/driveclub-recomp-Arm64-Aot-/actions/runs/46088122623/job/140802423737),
+[six Android 15 integration tests and launcher smoke checks](https://github.com/erickmendes22/driveclub-recomp-Arm64-Aot-/actions/runs/46088122623/job/140802424042),
+and [native ARM64/Bionic FEX ABI and heap regression](https://github.com/erickmendes22/driveclub-recomp-Arm64-Aot-/actions/runs/46088122623/job/140804435147).
+The functional source commit is `7ad4782d7ec5215e58c867ba317a4476384a6a30`.
+The delivered 0.6 APK is 17,209,904 bytes, SHA-256
+`15e49e45b1eacbf92f722d8c2331790cfec503e605f8639a042cc2f211e117de`.
+Its signature matches the delivered 0.5 certificate, the package ID is unchanged,
+and versionCode increases from 5 to 6. All 28 non-signature ZIP entries match the
+CI APK, and the audit passed again after private signing. A subsequent device
+run is still needed to observe the original game's progress beyond this crash.
 
 The failing device run mapped MainHeap at `0x2000000000` (530 MiB) and
 VideoPrivate at `0x5000000000` (3674 MiB), but failed to map FlexHeap at
