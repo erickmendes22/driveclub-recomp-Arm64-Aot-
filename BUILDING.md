@@ -218,9 +218,10 @@ To record a new profile after the code has changed a lot: build with `BB_PGO=gen
 The Android 0.7 target integrates the local preparer, Driveclub loader/HLE, FEXCore,
 the existing shadPS4-based renderer, local FPKG installation, a bundled Turnip
 selector and analogue touch controls. It targets `arm64-v8a`, Android 11/API 30
-or later, using Bionic throughout. The 0.6 APK audit, seven host PKG tests,
-six Android integration tests and native ARM64/Bionic FEX ABI and heap-regression
-checks passed.
+or later, using Bionic throughout. The 0.7 APK audit, seven host PKG tests,
+eleven synthetic import/provider tests, native ARM64/Bionic FEX regressions,
+all 2,041 declared public providers and the JPEG/PNG behavior tests passed.
+Android integration results are recorded below.
 Building the APK or passing synthetic tests does not
 establish that the original game reaches its menu or gameplay; that requires an
 Android device run with the user's game files and its startup log.
@@ -454,7 +455,42 @@ the new host contract tests, the packaged FEX regression, the actual linked
 resolver and JPEG/PNG execution on Bionic ARM64. The linked test extracts real
 system-library dependencies from the pinned official Android image using
 `fetch-bionic-runtime.py --platform-libraries`; those test libraries are never
-packaged in the app. Results for the 0.7 build are recorded after CI completes.
+packaged in the app.
+
+The delivered APK was built from functional commit
+`fad91389a5c4cf3d75c30a8fd6c908063a9c023c`. Its
+[ARM64 build and package audit](https://github.com/erickmendes22/driveclub-recomp-Arm64-Aot-/actions/runs/46093881851/job/140820735979)
+and [native ARM64/Bionic execution](https://github.com/erickmendes22/driveclub-recomp-Arm64-Aot-/actions/runs/46093881851/job/140822669824)
+passed. The latter ran the FEX library extracted from that APK, including the
+PRT/heap regression, real control/shutdown hooks and x86 libunwind restoration.
+The actual game library resolved all **2,041 of 2,041** public source providers
+(2,038 functions and three data bindings) with zero registration failures and
+no registration-created threads. JPEG and PNG behavior tests also exited zero
+under Bionic ARM64. This checks registration and the exercised contracts, not
+whether every function has complete console behavior or the game renders.
+
+An earlier Android run passed all nine integration tests and the log-export
+smoke. A repeat exposed a controls-test synchronization race: the test inspected
+a view before layout and did not clean up when setup failed. Test-only commit
+`fd2ce7297479eaa744033a080a8b7cf903d020f5` waits for actual creation/layout/destruction
+events with finite deadlines, retaining all control assertions. The production
+sources used by the delivered APK are unchanged. The
+[synchronized Android 15 launcher job](https://github.com/erickmendes22/driveclub-recomp-Arm64-Aot-/actions/runs/46094805485/job/140823608361)
+then passed **OK (9 tests)** and the complete selector, controls, diagnostics and
+log-export smoke. The exported document contained the session and Vulkan records.
+
+The [Linux build and AppImage smoke](https://github.com/erickmendes22/driveclub-recomp-Arm64-Aot-/actions/runs/46093887166)
+also passed after correcting an ambiguous Vulkan handle reset found by the
+compiler during the first attempt.
+
+The signed **Driveclub-Android-0.7-Turnip-FEX-arm64.apk** is **17,246,768 bytes**,
+SHA-256 `df5b7fde6f68cd4d2c45629ab4a92188eb419e35d91e9a291dbb64e5c6aaa023`.
+Its certificate matches the delivered 0.6 certificate, package ID remains
+`org.driveclub.port`, and versionCode increases from 6 to 7. All 28 non-signature
+ZIP entries match the tested CI APK, and the full APK audit passed after signing.
+The exact Turnip asset is unchanged. No original game executable, archive or
+prepared image is included. Menu, first rendered game frame and gameplay still
+require observation on the Android device with the user's content.
 
 #### Android 0.6 memory regression
 
