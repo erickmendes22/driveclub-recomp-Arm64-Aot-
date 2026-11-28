@@ -22,6 +22,9 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#ifndef MAP_FIXED_NOREPLACE
+#define MAP_FIXED_NOREPLACE 0x100000
+#endif
 #endif
 /* sceKernelGetDirectMemorySize on retail PS4: 5056 MiB. BB_DMEM_MB raises it (the resolution
  * patches above 1080p need about 4 GiB more; run.sh sets it). */
@@ -40,6 +43,10 @@ static uint64_t pool_size_bytes(void) {
 #define PAGE UINT64_C(16384)
 #define USER_MIN UINT64_C(0x1000000000)
 #define USER_MAX UINT64_C(0xfc00000000)
+/* Keep the 64--128 GiB band available for Driveclub's later fixed PRT aliases.
+ * This is an allocation preference, not a reduced guest memory budget or a
+ * claim about the host's VA width. Valid hints elsewhere are still honored. */
+#define NONFIXED_START UINT64_C(0x6000000000)
 #define LIMIT 4096
 #define INVALID ((int32_t)UINT32_C(0x80020016))
 #define NO_MEMORY ((int32_t)UINT32_C(0x8002000c))
@@ -162,6 +169,7 @@ static int host_prot(int prot) {
     /* GPU read/write bits (0x10/0x20) need host access for the future GPU backend. */
     return ((prot & 0x11) ? PROT_READ : 0) | ((prot & 0x22) ? PROT_WRITE|PROT_READ : 0) | ((prot & 4) ? PROT_EXEC|PROT_READ : 0);
 }
+
 #ifdef _WIN32
 /* ---- host mappings (Windows) ----
  * [USER_MIN,USER_MAX) is covered by regions, each one placeholder or one view of the
@@ -275,7 +283,8 @@ static size_t carve_host(uintptr_t a, uintptr_t b) {
     free(runs);
     return at;
 }
-static int host_map(uintptr_t address, uint64_t size, int prot, int reserved, uint64_t phys) {
+static int host_map(uintptr_t address, uint64_t size, int prot, int reserved, uint64_t phys, int fixed) {
+    (void)fixed; /* The Windows guest address range is already owned as placeholders. */
     size_t i=carve_host(address,address+size);
     if (reserved) return 0;
     regions[i].phys=phys; regions[i].mapped=1;
@@ -340,11 +349,26 @@ static int pool(void) {
     return 0;
 }
 void runtime_memory_reserve(void) {}
-static int host_map(uintptr_t address, uint64_t size, int prot, int reserved, uint64_t phys) {
-    void *mapped = !reserved
-        ? mmap((void *)address,size,prot,MAP_SHARED|MAP_FIXED,pool_fd,(off_t)phys)
-        : mmap((void *)address,size,PROT_NONE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE|MAP_FIXED,-1,0);
-    return mapped==MAP_FAILED ? -1 : 0;
+static int host_map(uintptr_t address, uint64_t size, int prot, int reserved, uint64_t phys, int fixed) {
+    const int flags=(reserved ? MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE : MAP_SHARED)
+                   | (fixed ? MAP_FIXED : MAP_FIXED_NOREPLACE);
+    void *mapped=mmap((void *)address,size,reserved ? PROT_NONE : prot,flags,
+                      reserved ? -1 : pool_fd,reserved ? 0 : (off_t)phys);
+    if (mapped!=MAP_FAILED && (uintptr_t)mapped==address) return 0;
+    int error=errno;
+    if (mapped!=MAP_FAILED) {
+        /* An older kernel can ignore NOREPLACE and treat the address as a hint.
+         * Never register that mapping as though it existed at the requested VA. */
+        const int unmapped=munmap(mapped,size);
+        error=unmapped ? errno : EOPNOTSUPP;
+    }
+    fprintf(stderr,"Runtime: host mmap failed: address=0x%" PRIxPTR ", end=0x%" PRIxPTR
+            ", bytes=%" PRIu64 ", prot=0x%x, flags=0x%x, backing=%s, offset=0x%" PRIx64
+            ", errno=%d (%s)\n",address,address+size,size,reserved ? PROT_NONE : prot,flags,
+            reserved ? "reservation" : phys>=POOL_SIZE ? "flexible" : "direct",reserved ? UINT64_C(0) : phys,
+            error,strerror(error));
+    errno=error;
+    return -1;
 }
 static int host_unmap(uintptr_t address, uint64_t size) { return munmap((void *)address,size); }
 static int host_protect(uintptr_t address, uint64_t size, int prot) { return mprotect((void *)address,size,prot); }
@@ -393,13 +417,21 @@ static size_t vma_index(uintptr_t a) { /* first VMA with end > a */
     while (lo<hi) { size_t mid=(lo+hi)/2; if (vmas[mid].end<=a) lo=mid+1; else hi=mid; }
     return lo;
 }
-static int vma_insert(size_t at, Vma v) {
-    if (vma_count==vma_capacity) {
-        size_t capacity=vma_capacity ? vma_capacity*2 : 256;
-        Vma *next=realloc(vmas,capacity*sizeof(*vmas));
-        if (!next) return -1;
-        vmas=next; vma_capacity=capacity;
+static int vma_reserve(size_t needed) {
+    if (needed<=vma_capacity) return 0;
+    if (needed>SIZE_MAX/sizeof(*vmas)) return -1;
+    size_t capacity=vma_capacity ? vma_capacity : 256;
+    while (capacity<needed) {
+        if (capacity>SIZE_MAX/2/sizeof(*vmas)) { capacity=needed; break; }
+        capacity*=2;
     }
+    Vma *next=realloc(vmas,capacity*sizeof(*vmas));
+    if (!next) return -1;
+    vmas=next; vma_capacity=capacity;
+    return 0;
+}
+static int vma_insert(size_t at, Vma v) {
+    if (vma_count==SIZE_MAX || vma_reserve(vma_count+1)) return -1;
     memmove(vmas+at+1,vmas+at,(vma_count-at)*sizeof(*vmas));
     vmas[at]=v; ++vma_count; return 0;
 }
@@ -436,13 +468,39 @@ static int overlaps(uintptr_t start, uintptr_t end, int ignore_reserved) {
 }
 /* First-fit search in the PS4 user range, starting from the hint. */
 static uintptr_t find_free(uintptr_t hint, uint64_t size, uint64_t alignment) {
-    uintptr_t at=align_up(hint<USER_MIN ? USER_MIN : hint, alignment);
-    for (size_t i=vma_index(at); at+size<=USER_MAX; ++i) {
+    if (hint<USER_MIN) hint=USER_MIN;
+    if (hint>USER_MAX || alignment-1>USER_MAX-hint) return 0;
+    uintptr_t at=align_up(hint, alignment);
+    for (size_t i=vma_index(at); at<=USER_MAX && size<=USER_MAX-at; ++i) {
         if (i==vma_count || vmas[i].start>=at+size) return at;
+        if (vmas[i].end>USER_MAX || alignment-1>USER_MAX-vmas[i].end) return 0;
         at=align_up(vmas[i].end,alignment);
     }
     return 0;
 }
+#ifndef _WIN32
+/* The guest VMA table does not contain ART, FEX, driver or libc mappings. Use
+ * the host's map snapshot to skip those too; NOREPLACE on the real mapping is
+ * still required because another host thread can map after this snapshot. */
+static uintptr_t find_host_free(uint64_t size, uint64_t alignment) {
+    uintptr_t at=find_free(NONFIXED_START,size,alignment);
+    if (!at) { errno=ENOMEM; return 0; }
+    FILE *file=fopen("/proc/self/maps","r");
+    if (!file) return 0;
+    char line[1024];
+    while (fgets(line,sizeof(line),file)) {
+        uintptr_t start,end;
+        if (sscanf(line,"%" SCNxPTR "-%" SCNxPTR,&start,&end)!=2 || end<=at) continue;
+        if (start>=at && size<=start-at) break;
+        at=find_free(end,size,alignment);
+        if (!at) break;
+    }
+    const int error=ferror(file) ? (errno ? errno : EIO) : at ? 0 : ENOMEM;
+    fclose(file);
+    if (error) { errno=error; return 0; }
+    return at;
+}
+#endif
 static void drop_range(uintptr_t start, uintptr_t end) {
     int error; size_t i=carve(start,end,&error), n=0;
     while (i+n<vma_count && vmas[i+n].end<=end && vmas[i+n].start>=start) {
@@ -457,20 +515,61 @@ static void drop_range(uintptr_t start, uintptr_t end) {
 /* Places a host mapping; with MAP_FIXED it replaces what the guest had there. */
 static int32_t place(void **inout, uint64_t size, int prot, int flags, uint64_t alignment,
                      int kind, int type, uint64_t phys) {
-    uintptr_t address=(uintptr_t)*inout;
-    if (flags & MAP_FIXED_FLAG) {
-        if (!address || address%PAGE) return INVALID;
+    const uintptr_t requested=(uintptr_t)*inout;
+    const int fixed=!!(flags&MAP_FIXED_FLAG);
+    uintptr_t address=requested;
+    if (fixed) {
+        if (!address || address%PAGE || size>UINTPTR_MAX-address) return INVALID;
         if ((flags & MAP_NO_OVERWRITE) && overlaps(address,address+size,1)) return mem_fail(NO_MEMORY, __LINE__);
     } else {
+#ifdef _WIN32
         address=find_free(address,size,alignment);
-        if (!address) return mem_fail(NO_MEMORY, __LINE__);
+#else
+        address=find_free(address>=USER_MIN ? address : NONFIXED_START,size,alignment);
+#endif
     }
-    if (host_map(address,size,host_prot(prot),kind==KIND_RESERVED,phys)) return mem_fail(NO_MEMORY, __LINE__);
+    /* At most two boundary splits and one insertion follow a successful host
+     * mapping. Obtain the metadata capacity first so failure cannot strand a
+     * new mapping or destroy the old VMA description after MAP_FIXED. */
+    if (vma_count>SIZE_MAX-3 || vma_reserve(vma_count+3)) return mem_fail(NO_MEMORY, __LINE__);
+#ifdef _WIN32
+    if (!address) return mem_fail(NO_MEMORY, __LINE__);
+    if (host_map(address,size,host_prot(prot),kind==KIND_RESERVED,phys,fixed)) return mem_fail(NO_MEMORY, __LINE__);
+#else
+    int host_mapped=address && !host_map(address,size,host_prot(prot),kind==KIND_RESERVED,phys,fixed);
+    int error=address ? errno : ENOMEM;
+    if (!host_mapped && !fixed && (error==ENOMEM || error==EINVAL || error==EEXIST)) {
+        /* Only collisions justify rescanning: ENOMEM/EINVAL at the first
+         * fallback candidate must not become a page-by-page VA-width search. */
+        for (unsigned attempt=0;attempt<16;++attempt) {
+            address=find_host_free(size,alignment);
+            if (!address) { error=errno; break; }
+            if (!host_map(address,size,host_prot(prot),kind==KIND_RESERVED,phys,0)) { host_mapped=1; break; }
+            error=errno;
+            if (error!=EEXIST) break;
+        }
+    }
+    if (!host_mapped) {
+        fprintf(stderr,"Runtime: %s guest map failed: hint=0x%" PRIxPTR ", bytes=%" PRIu64
+                ", alignment=0x%" PRIx64 ", errno=%d (%s)\n",
+                fixed ? "fixed" : "non-fixed",requested,size,alignment,error,strerror(error));
+        errno=error;
+        return mem_fail(NO_MEMORY, __LINE__);
+    }
+    if (requested && requested!=address)
+        printf("Runtime: relocated non-fixed mapping: hint=0x%" PRIxPTR " -> address=0x%" PRIxPTR
+               ", bytes=%" PRIu64 ", alignment=0x%" PRIx64 "\n",requested,address,size,alignment);
+#endif
     void *mapped=(void *)address;
     drop_range(address,address+size);
     Vma region={address,address+size,kind,prot,type,phys,{0}};
     strcpy(region.name,kind==KIND_RESERVED ? "reserved" : kind==KIND_DIRECT ? "direct" : "flexible");
-    if (vma_insert(vma_index(address),region)) return mem_fail(NO_MEMORY, __LINE__);
+    if (vma_insert(vma_index(address),region)) {
+        /* Capacity was reserved above; retain a rollback even if that invariant
+         * changes later. A non-fixed map has replaced no earlier guest VMA. */
+        if (!fixed) host_unmap(address,size);
+        return mem_fail(NO_MEMORY, __LINE__);
+    }
     if (kind==KIND_FLEXIBLE) flexible_bytes+=size;
     if (kind!=KIND_RESERVED) queue_hook(HOOK_MAP,address,size);
     *inout=mapped;

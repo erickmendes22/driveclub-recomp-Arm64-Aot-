@@ -98,7 +98,8 @@ jobs:
         run: |
           mkdir -p out/fex-test
           unzip -j android/build/outputs/apk/debug/*.apk 'lib/arm64-v8a/libbbcpu.so' 'lib/arm64-v8a/libc++_shared.so' -d out/fex-test
-          "$ANDROID_HOME/ndk/29.0.14206865/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android30-clang++" tests/test_android_fex.cpp out/android-runtime/libdriveclub-runtime.a -Wl,--gc-sections -Lout/fex-test -lbbcpu -o out/fex-test/test-fex
+          runtime_archive="$(python3 -c 'from pathlib import Path; archives=list(Path("android/.cxx").glob("**/arm64-v8a/libdriveclub_runtime.a")); assert len(archives) == 1, archives; print(archives[0])')"
+          "$ANDROID_HOME/ndk/29.0.14206865/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android30-clang++" tests/test_android_fex.cpp "$runtime_archive" -Wl,--gc-sections -Wl,--wrap=mmap -Lout/fex-test -lbbcpu -o out/fex-test/test-fex
       - uses: actions/upload-artifact@v4
         with:
           name: bionic-fex-test

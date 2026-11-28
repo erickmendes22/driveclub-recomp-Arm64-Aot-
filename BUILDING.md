@@ -215,7 +215,7 @@ To record a new profile after the code has changed a lot: build with `BB_PGO=gen
 
 ## Android ARM64 (Bionic and FEX)
 
-The Android 0.5 target integrates the local preparer, Driveclub loader/HLE, FEXCore,
+The Android 0.6 target integrates the local preparer, Driveclub loader/HLE, FEXCore,
 the existing shadPS4-based renderer, local FPKG installation, a bundled Turnip
 selector and analogue touch controls. It targets `arm64-v8a`, Android 11/API 30
 or later, using Bionic throughout. The 0.5 APK audit, seven host PKG tests,
@@ -223,6 +223,13 @@ six Android integration tests and five native ARM64/Bionic FEX checks passed.
 Building the APK or passing synthetic tests does not
 establish that the original game reaches its menu or gameplay; that requires an
 Android device run with the user's game files and its startup log.
+
+The supplied 0.5 device log confirms local preparation of update 1.28, loading
+Turnip Gen8 V39-patched on Adreno 840, creation of the native Vulkan swapchain,
+initialization of all seven boot modules and entry into the original game code.
+It then records failed mappings for FlexHeap and MagicMemory, followed by a native
+fault when the game calls `memmove` into the unmapped FlexHeap. That run does not
+establish menu or gameplay rendering.
 
 ### Build
 
@@ -400,6 +407,45 @@ Vulkan probe alone does not prove that those renderer requirements are satisfied
 
 ### Verification
 
+#### Android 0.6 memory regression
+
+The failing device run mapped MainHeap at `0x2000000000` (530 MiB) and
+VideoPrivate at `0x5000000000` (3674 MiB), but failed to map FlexHeap at
+`0xf000000000` (338 MiB) and MagicMemory at `0xa000000000` (176 MiB). The
+successful addresses are below 512 GiB and the failed ones are above it. This
+is consistent with a 39-bit host address space; the old log discarded the
+underlying `mmap` errno, so it does not independently measure the device's VA width.
+
+Inspection of the supplied 1.28 executable confirms that the four boot mappings
+pass guest flags `0`, and the game reloads the bases through the output pointers
+before constructing its heaps. Those bases are hints, not fixed guest mappings.
+The faulting return offset `0x7eb837` follows a `memmove` call whose destination
+comes from the heap allocator. The correction therefore belongs in the runtime's
+non-fixed mapping path; it does not require patching the game executable or
+rewriting guest pointers.
+
+Version 0.6 first tries the guest's non-fixed hint with `MAP_FIXED_NOREPLACE`.
+If that address is unavailable, it searches from 384 GiB, skips both guest and
+native host mappings, and confirms the chosen range with the same atomic
+no-overwrite operation. This keeps the 64 GiB fixed PRT alias window available.
+Only a successful mapping changes the guest's output pointer; fixed requests
+retain their exact-address semantics. The direct and flexible budgets are
+unchanged. Failure logs now retain the host errno, range, protection and backing
+offset, and a successful change records both the hint and the returned address.
+
+The regression tests reproduce the four full heap sizes with only the host
+mapping failures above `2^39` simulated. Successful mappings and backing storage
+remain real. The ARM64 test links the same Bionic runtime archive as the app and
+uses FEX from the built APK: x86-64 code reloads the returned FlexHeap address,
+calls Bionic `memmove` at `FlexHeap + 0x020000cc`, and verifies the same bytes
+through the renderer's backing-memory API. It also checks disjoint heaps, the
+unchanged 5056 MiB direct-memory budget, 2 MiB direct alignment, the fixed alias
+at 64 GiB and release of its shared backing. No game executable or assets are
+included in these tests. The simulated ceiling is a linker wrapper in the test
+only, not an APK setting.
+
+The previous 0.5 evidence below remains useful for features unchanged by the fix.
+
 The 0.5 validation records are the
 [ARM64 APK audit and native Bionic/FEX run](https://github.com/erickmendes22/driveclub-recomp-Arm64-Aot-/actions/runs/46082315169)
 and the [Android 15 integration, controls and log-export job](https://github.com/erickmendes22/driveclub-recomp-Arm64-Aot-/actions/runs/46083788175/job/140788571573).
@@ -470,7 +516,7 @@ Build the FEX ABI test against the backend extracted from the APK:
       'lib/arm64-v8a/libbbcpu.so' 'lib/arm64-v8a/libc++_shared.so' -d out/fex-test
     "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android30-clang++" \
       -std=c++20 tests/test_android_fex.cpp out/android-runtime/libdriveclub-runtime.a \
-      -Wl,--gc-sections -Wl,-z,max-page-size=16384 -Lout/fex-test -lbbcpu -o out/fex-test/test-fex
+      -Wl,--gc-sections -Wl,--wrap=mmap -Wl,-z,max-page-size=16384 -Lout/fex-test -lbbcpu -o out/fex-test/test-fex
 
 For a host-side run, obtain the pinned official Android API 30 ARM64 Bionic runtime
 with `fetch-bionic-runtime.py`. Extraction needs `debugfs` from `e2fsprogs` and about
@@ -488,7 +534,8 @@ omit `--qemu`. On an ARM64 Android device, the test directory can instead be pus
 with `adb` and the binary run with its directory in `LD_LIBRARY_PATH`.
 
 The test exercises integer/XMM arguments, host thunks, a nested guest callback,
-code invalidation and the production low-address allocator. QEMU execution,
+code invalidation, the production low-address allocator and the heap regression
+described above. QEMU execution,
 native ARM64 execution and the launcher emulator test are separate checks; none
 runs the original game or validates Vulkan rendering. CI runs the FEX test against
 the backend extracted from its own APK. Its Android 15 x86_64 emulator job builds
